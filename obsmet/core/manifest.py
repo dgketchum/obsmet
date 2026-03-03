@@ -47,19 +47,13 @@ class Manifest:
     def pending_keys(self, all_keys: list[str]) -> list[str]:
         """Return keys that are not yet 'done'."""
         df = self._load()
-        done = set(
-            df.loc[(df["source"] == self.source) & (df["state"] == "done"), "key"]
-        )
+        done = set(df.loc[(df["source"] == self.source) & (df["state"] == "done"), "key"])
         return [k for k in all_keys if k not in done]
 
-    def update(
-        self, key: str, state: str, *, run_id: str = "", message: str = ""
-    ) -> None:
+    def update(self, key: str, state: str, *, run_id: str = "", message: str = "") -> None:
         """Record or update a key's state."""
         if state not in MANIFEST_STATES:
-            raise ValueError(
-                f"Invalid state {state!r}; must be one of {MANIFEST_STATES}"
-            )
+            raise ValueError(f"Invalid state {state!r}; must be one of {MANIFEST_STATES}")
         df = self._load()
         now = pd.Timestamp(datetime.now(timezone.utc))
         new_row = pd.DataFrame(

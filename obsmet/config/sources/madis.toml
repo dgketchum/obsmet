@@ -1,0 +1,13 @@
+[madis]
+raw_dir = "/nas/climate/obsmet/raw/madis"
+credentials_path = "~/.config/obsmet/madis_credentials.json"
+
+# CONUS default bounding box (west, south, east, north)
+bounds = [-125.0, 24.0, -66.0, 53.0]
+
+# QCR reject bitmask: master(1) | validity(2) | temporal(16) | stat_spatial(32) | buddy(64)
+# Excludes bit 4 (internal consistency = 8) — Td>T handled separately.
+qcr_reject_bits = 115
+
+# Archive period of record
+por_start = "2001-07-01"
