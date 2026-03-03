@@ -1,0 +1,20 @@
+[storage]
+root = "/nas/climate/obsmet"
+raw = "${storage.root}/raw"
+normalized = "${storage.root}/normalized"
+qaqc = "${storage.root}/qaqc"
+products = "${storage.root}/products"
+artifacts = "${storage.root}/artifacts"
+
+[processing]
+workers = 4
+overwrite = false
+
+[qaqc]
+mode = "strict"
+
+[daily]
+day_basis = "utc"
+
+[crosswalk]
+confidence_threshold = "high"
