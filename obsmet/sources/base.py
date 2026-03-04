@@ -36,3 +36,13 @@ class SourceAdapter(ABC):
         The returned DataFrame must conform to OBS_HOURLY_SCHEMA columns.
         """
         ...
+
+    def normalize_key(self, key: str, provenance: RunProvenance, **kwargs) -> pd.DataFrame | None:
+        """Normalize a single key. Default: fetch_raw then normalize."""
+        dest_dir = kwargs.get("dest_dir", Path("."))
+        raw_path = self.fetch_raw(key, dest_dir)
+        return self.normalize(raw_path, provenance)
+
+    def output_filename(self, key: str) -> str:
+        """Derive output filename from key. Default: {key}.parquet."""
+        return f"{key}.parquet"

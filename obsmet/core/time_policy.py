@@ -12,6 +12,8 @@ from enum import Enum
 import numpy as np
 import pandas as pd
 
+from obsmet.core.provenance import RunProvenance
+
 
 class DayBasis(str, Enum):
     """Supported daily aggregation bases (plan decision D2: UTC-only for v1)."""
@@ -136,3 +138,114 @@ def circular_mean_deg(angles: pd.Series) -> float:
     mean_cos = np.mean(np.cos(rad))
     mean_angle = np.rad2deg(np.arctan2(mean_sin, mean_cos)) % 360
     return float(mean_angle)
+
+
+# --------------------------------------------------------------------------- #
+# Daily aggregation engine (wide-form)
+# --------------------------------------------------------------------------- #
+
+# Sources that support hourly → daily aggregation
+DAILY_SOURCES = ["madis", "isd", "gdas", "ndbc"]
+
+# Variables and their aggregation method for daily rollup from hourly data
+DAILY_AGG_MAP = {
+    "tair": "mean",
+    "td": "mean",
+    "rh": "mean",
+    "wind": "mean",
+    "wind_dir": "circular_mean",
+    "slp": "mean",
+    "prcp": "sum",
+}
+
+
+def aggregate_daily_wide(
+    df: pd.DataFrame,
+    provenance: RunProvenance,
+    *,
+    agg_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Aggregate wide-form hourly observations to daily records.
+
+    Input: wide-form hourly DataFrame with station_key, datetime_utc,
+    and variable columns.
+    Output: DataFrame conforming to OBS_DAILY_CORE_SCHEMA + DAILY_METRIC_FIELDS.
+
+    Parameters
+    ----------
+    df : Wide-form hourly DataFrame.
+    provenance : RunProvenance for this pipeline run.
+    agg_map : Override aggregation map. Defaults to DAILY_AGG_MAP.
+    """
+    if agg_map is None:
+        agg_map = DAILY_AGG_MAP
+
+    if df.empty or "datetime_utc" not in df.columns:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+    df["date"] = df["datetime_utc"].dt.date
+
+    if "station_key" not in df.columns:
+        return pd.DataFrame()
+
+    groups = df.groupby(["station_key", "date"])
+
+    daily_records = []
+    for (stn, day), grp in groups:
+        cov = hourly_coverage(grp["datetime_utc"], day)
+        cov_str = (
+            f"n={cov['obs_count']}"
+            f",thresh={'Y' if cov['meets_threshold'] else 'N'}"
+            f",am={'Y' if cov['morning_ok'] else 'N'}"
+            f",pm={'Y' if cov['afternoon_ok'] else 'N'}"
+        )
+
+        rec = {
+            "station_key": stn,
+            "date": day,
+            "day_basis": "utc",
+            "obs_count": len(grp),
+            "coverage_flags": cov_str,
+            "qc_state": "pass",
+            "qc_rules_version": provenance.qaqc_rules_version,
+            "transform_version": provenance.transform_version,
+            "ingest_run_id": provenance.run_id,
+        }
+
+        for var, agg_type in agg_map.items():
+            if var not in grp.columns:
+                continue
+            vals = pd.to_numeric(grp[var], errors="coerce").dropna()
+            if vals.empty:
+                continue
+            if agg_type == "mean":
+                rec[var] = float(vals.mean())
+            elif agg_type == "sum":
+                rec[var] = float(vals.sum())
+            elif agg_type == "circular_mean":
+                rec[var] = circular_mean_deg(vals)
+
+        # Tmax/tmin/tmean from tair
+        if "tair" in grp.columns:
+            tair_vals = pd.to_numeric(grp["tair"], errors="coerce").dropna()
+            if not tair_vals.empty:
+                rec["tmax"] = float(tair_vals.max())
+                rec["tmin"] = float(tair_vals.min())
+                rec["tmean"] = float(tair_vals.mean())
+
+        # Convert rsds_hourly W/m² to rsds MJ/m²/day
+        if "rsds_hourly" in grp.columns:
+            rsds_vals = pd.to_numeric(grp["rsds_hourly"], errors="coerce").dropna()
+            if not rsds_vals.empty:
+                rec["rsds"] = float(rsds_vals.mean()) * 86400.0 / 1e6
+
+        daily_records.append(rec)
+
+    if not daily_records:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(daily_records)
+    result["date"] = pd.to_datetime(result["date"])
+    return result

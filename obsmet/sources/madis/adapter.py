@@ -292,7 +292,11 @@ class MadisAdapter(SourceAdapter):
         The day is determined from the provenance or must be passed
         via the key parameter in the pipeline.
         """
-        raise NotImplementedError("Use normalize_day() with an explicit day_str instead.")
+        raise NotImplementedError("Use normalize_key() with an explicit day_str instead.")
+
+    def normalize_key(self, key: str, provenance: RunProvenance, **kwargs) -> pd.DataFrame | None:
+        """Normalize a single MADIS day key via extract_and_normalize_day."""
+        return self.extract_and_normalize_day(key, provenance, wide=True)
 
     def extract_and_normalize_day(
         self,

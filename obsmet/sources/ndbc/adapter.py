@@ -131,6 +131,19 @@ class NdbcAdapter(SourceAdapter):
         """Return path to raw directory for a station key."""
         return self.raw_dir
 
+    def normalize_key(self, key: str, provenance: RunProvenance, **kwargs) -> pd.DataFrame | None:
+        """Normalize a single NDBC station key."""
+        from obsmet.sources.ndbc.extract import read_station_files
+
+        df = read_station_files(self.raw_dir, key)
+        if df.empty:
+            return None
+        return normalize_to_canonical_wide(df, key, provenance)
+
+    def output_filename(self, key: str) -> str:
+        """Derive output filename from station ID."""
+        return f"{key}.parquet"
+
     def normalize(self, raw_path: Path, provenance: RunProvenance) -> pd.DataFrame:
         """Read and normalize a station's stdmet files."""
         from obsmet.sources.ndbc.extract import read_station_files

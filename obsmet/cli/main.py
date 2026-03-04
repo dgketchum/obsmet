@@ -25,6 +25,41 @@ def cli():
     """obsmet — unified meteorological observation pipeline."""
 
 
+# --------------------------------------------------------------------------- #
+# Default paths per source
+# --------------------------------------------------------------------------- #
+
+_DEFAULT_RAW_DIRS = {
+    "madis": "/nas/climate/obsmet/raw/madis",
+    "isd": "/nas/climate/isd/raw",
+    "gdas": "/nas/climate/gdas/prepbufr",
+    "raws": "/nas/climate/obsmet/raw/raws_wrcc",
+    "ndbc": "/nas/climate/obsmet/raw/ndbc",
+}
+
+_DEFAULT_NORM_DIRS = {
+    "madis": "/nas/climate/obsmet/normalized/madis",
+    "isd": "/nas/climate/obsmet/normalized/isd",
+    "gdas": "/nas/climate/obsmet/normalized/gdas",
+    "raws": "/nas/climate/obsmet/normalized/raws_wrcc",
+    "ndbc": "/nas/climate/obsmet/normalized/ndbc",
+}
+
+# Manifest source names (some differ from CLI source name)
+_MANIFEST_SOURCE = {
+    "madis": "madis",
+    "isd": "isd",
+    "gdas": "gdas",
+    "raws": "raws_wrcc",
+    "ndbc": "ndbc",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Ingest command
+# --------------------------------------------------------------------------- #
+
+
 @cli.command()
 @click.argument("source")
 @click.option("--raw-dir", default=None, help="Override raw data directory")
@@ -42,18 +77,169 @@ def cli():
 @common_options
 def ingest(source, raw_dir, bounds, qcr_mask, start, end, resume, workers, overwrite, dry_run):
     """Download/scrape raw data for SOURCE."""
-    if source == "madis":
-        _ingest_madis(start, end, raw_dir, resume, dry_run)
-    elif source == "isd":
-        _ingest_isd(start, end, raw_dir, resume, workers, dry_run)
-    elif source == "gdas":
-        _ingest_gdas(start, end, raw_dir, resume, workers, dry_run)
-    elif source == "raws":
-        _ingest_raws(start, end, raw_dir, bounds, resume, dry_run)
-    elif source == "ndbc":
-        _ingest_ndbc(start, end, raw_dir, resume, dry_run)
-    else:
+    _INGEST_DISPATCH = {
+        "madis": _ingest_madis,
+        "isd": _ingest_isd,
+        "gdas": _ingest_gdas,
+        "raws": _ingest_raws,
+        "ndbc": _ingest_ndbc,
+    }
+    fn = _INGEST_DISPATCH.get(source)
+    if fn is None:
         click.echo(f"Source {source!r} not yet implemented.")
+        return
+    fn(
+        start=start,
+        end=end,
+        raw_dir=raw_dir,
+        bounds=bounds,
+        qcr_mask=qcr_mask,
+        resume=resume,
+        workers=workers,
+        dry_run=dry_run,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Normalize command — generic dispatch
+# --------------------------------------------------------------------------- #
+
+
+def _normalize_one(key, source_name, raw_dir, out_dir, run_id, overwrite, adapter_kwargs):
+    """Module-level worker for normalize (picklable for ProcessPoolExecutor).
+
+    Creates adapter inside the worker via registry (lazy import).
+    """
+    from pathlib import Path
+
+    from obsmet.core.provenance import RunProvenance
+    from obsmet.sources.registry import create_adapter
+
+    adapter = create_adapter(source_name, raw_dir=raw_dir, **adapter_kwargs)
+    provenance = RunProvenance(
+        source=_MANIFEST_SOURCE[source_name], command="normalize", run_id=run_id
+    )
+    out_dir = Path(out_dir)
+
+    out_path = out_dir / adapter.output_filename(key)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists() and not overwrite:
+        return key, None, None
+
+    df = adapter.normalize_key(key, provenance)
+    if df is None or df.empty:
+        return key, 0, "no data"
+
+    df.to_parquet(out_path, index=False, compression="snappy")
+    return key, len(df), None
+
+
+def _run_normalize(
+    source_name, start, end, raw_dir, out_dir, resume, workers, overwrite, dry_run, **adapter_kwargs
+):
+    """Generic normalize pipeline for any source."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from functools import partial
+    from pathlib import Path
+
+    from obsmet.core.manifest import Manifest
+    from obsmet.core.provenance import RunProvenance
+    from obsmet.sources.registry import create_adapter, get_source
+
+    entry = get_source(source_name)
+    msrc = _MANIFEST_SOURCE[source_name]
+
+    raw_dir = raw_dir or _DEFAULT_RAW_DIRS[source_name]
+    out_dir = Path(out_dir) if out_dir else Path(_DEFAULT_NORM_DIRS[source_name])
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    adapter = create_adapter(source_name, raw_dir=raw_dir, **adapter_kwargs)
+    provenance = RunProvenance(source=msrc, command="normalize")
+
+    manifest_path = out_dir / "manifest.parquet"
+    manifest = Manifest(manifest_path, source=msrc)
+
+    if start is None or end is None:
+        click.echo(f"Error: --start and --end are required for {source_name} normalize.")
+        return
+
+    keys = adapter.discover_keys(start, end)
+    if resume:
+        keys = manifest.pending_keys(keys)
+
+    click.echo(f"{source_name.upper()} normalize: {len(keys)} keys, {workers} workers → {out_dir}")
+
+    if dry_run:
+        for k in keys[:10]:
+            click.echo(f"  would normalize: {k}")
+        if len(keys) > 10:
+            click.echo(f"  ... and {len(keys) - 10} more")
+        return
+
+    worker = partial(
+        _normalize_one,
+        source_name=source_name,
+        raw_dir=raw_dir,
+        out_dir=str(out_dir),
+        run_id=provenance.run_id,
+        overwrite=overwrite,
+        adapter_kwargs=adapter_kwargs,
+    )
+
+    done = 0
+    errors = 0
+    skipped = 0
+
+    use_parallel = entry.parallel and workers > 1
+
+    if use_parallel:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(worker, k): k for k in keys}
+            for fut in as_completed(futures):
+                key = futures[fut]
+                try:
+                    _, nrows, err = fut.result()
+                except Exception as exc:
+                    manifest.update(key, "failed", run_id=provenance.run_id, message=str(exc))
+                    errors += 1
+                    done += 1
+                    continue
+                if nrows is None:
+                    skipped += 1
+                elif err:
+                    manifest.update(key, "missing", run_id=provenance.run_id, message=err)
+                    errors += 1
+                else:
+                    manifest.update(key, "done", run_id=provenance.run_id)
+                done += 1
+                if done % 100 == 0:
+                    click.echo(f"  progress: {done}/{len(keys)}, {skipped} skip, {errors} err")
+                    manifest.flush()
+    else:
+        for key in keys:
+            try:
+                _, nrows, err = worker(key)
+            except Exception as exc:
+                manifest.update(key, "failed", run_id=provenance.run_id, message=str(exc))
+                errors += 1
+                done += 1
+                continue
+            if nrows is None:
+                skipped += 1
+            elif err:
+                manifest.update(key, "missing", run_id=provenance.run_id, message=err)
+                errors += 1
+            else:
+                manifest.update(key, "done", run_id=provenance.run_id)
+            done += 1
+            if done % 100 == 0:
+                click.echo(f"  progress: {done}/{len(keys)}, {skipped} skip, {errors} err")
+                manifest.flush()
+
+    manifest.flush()
+    click.echo(
+        f"{source_name.upper()} normalize done: {done} processed, {skipped} skipped, {errors} errors"
+    )
 
 
 @cli.command()
@@ -76,20 +262,37 @@ def normalize(
     source, raw_dir, out_dir, bounds, qcr_mask, start, end, resume, workers, overwrite, dry_run
 ):
     """Parse raw files into canonical observation rows for SOURCE."""
-    if source == "madis":
-        _normalize_madis(
-            start, end, raw_dir, out_dir, bounds, qcr_mask, resume, workers, overwrite, dry_run
-        )
-    elif source == "isd":
-        _normalize_isd(start, end, raw_dir, out_dir, resume, workers, overwrite, dry_run)
-    elif source == "gdas":
-        _normalize_gdas(start, end, raw_dir, out_dir, resume, workers, overwrite, dry_run)
-    elif source == "raws":
-        _normalize_raws(start, end, raw_dir, out_dir, resume, overwrite, dry_run)
-    elif source == "ndbc":
-        _normalize_ndbc(start, end, raw_dir, out_dir, resume, workers, overwrite, dry_run)
-    else:
+    from obsmet.sources.registry import list_sources
+
+    if source not in list_sources():
         click.echo(f"Source {source!r} not yet implemented.")
+        return
+
+    # Build source-specific adapter kwargs
+    adapter_kwargs = {}
+    if source == "madis":
+        if bounds:
+            adapter_kwargs["bounds"] = tuple(float(x) for x in bounds.split(","))
+        if qcr_mask is not None:
+            adapter_kwargs["qcr_mask"] = qcr_mask
+
+    _run_normalize(
+        source,
+        start,
+        end,
+        raw_dir,
+        out_dir,
+        resume,
+        workers,
+        overwrite,
+        dry_run,
+        **adapter_kwargs,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# QAQC, Build, Crosswalk, Corrections, Diagnostics
+# --------------------------------------------------------------------------- #
 
 
 @cli.command()
@@ -170,11 +373,11 @@ def diag_qc(source, start, end, resume, workers, overwrite, dry_run):
 
 
 # --------------------------------------------------------------------------- #
-# MADIS implementation
+# Ingest implementations (source-specific, kept separate)
 # --------------------------------------------------------------------------- #
 
 
-def _ingest_madis(start, end, raw_dir, resume, dry_run):
+def _ingest_madis(start, end, raw_dir, resume, dry_run, **_kw):
     """Download raw MADIS files for a date range."""
     from pathlib import Path
 
@@ -201,7 +404,6 @@ def _ingest_madis(start, end, raw_dir, resume, dry_run):
         days.append(current)
         current += timedelta(days=1)
 
-    # Filter by manifest if resuming
     day_strs = [d.strftime("%Y%m%d") for d in days]
     if resume:
         day_strs = manifest.pending_keys(day_strs)
@@ -237,153 +439,7 @@ def _ingest_madis(start, end, raw_dir, resume, dry_run):
     click.echo(f"MADIS ingest done: {ok} ok, {fail} failed")
 
 
-def _madis_normalize_one(day_str, raw_dir, bounds, qcr_mask, out_dir, run_id, overwrite):
-    """Module-level worker for MADIS normalize (picklable for ProcessPoolExecutor)."""
-    from pathlib import Path
-
-    from obsmet.core.provenance import RunProvenance
-    from obsmet.sources.madis.adapter import MadisAdapter
-
-    adapter = MadisAdapter(raw_dir=raw_dir, bounds=bounds, qcr_mask=qcr_mask)
-    provenance = RunProvenance(source="madis", command="normalize", run_id=run_id)
-    out_dir = Path(out_dir)
-
-    out_path = out_dir / f"{day_str}.parquet"
-    if out_path.exists() and not overwrite:
-        return day_str, None, None
-
-    df = adapter.extract_and_normalize_day(day_str, provenance, wide=True)
-    if df is None or df.empty:
-        return day_str, 0, "no data"
-
-    df.to_parquet(out_path, index=False, compression="snappy")
-    return day_str, len(df), None
-
-
-def _normalize_madis(
-    start, end, raw_dir, out_dir, bounds, qcr_mask, resume, workers, overwrite, dry_run
-):
-    """Extract, QC, and normalize MADIS data for a date range."""
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    from datetime import timedelta
-    from functools import partial
-    from pathlib import Path
-
-    from obsmet.core.manifest import Manifest
-    from obsmet.core.provenance import RunProvenance
-    from obsmet.sources.madis.extract import QCR_REJECT_BITS
-
-    raw_dir = raw_dir or "/nas/climate/obsmet/raw/madis"
-    out_dir = Path(out_dir) if out_dir else Path("/nas/climate/obsmet/normalized/madis")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    parsed_bounds = None
-    if bounds:
-        parsed_bounds = tuple(float(x) for x in bounds.split(","))
-
-    mask = qcr_mask if qcr_mask is not None else QCR_REJECT_BITS
-    provenance = RunProvenance(source="madis", command="normalize")
-
-    manifest_path = out_dir / "manifest.parquet"
-    manifest = Manifest(manifest_path, source="madis")
-
-    if start is None or end is None:
-        click.echo("Error: --start and --end are required for madis normalize.")
-        return
-
-    # Build day list
-    days = []
-    current = start
-    while current <= end:
-        days.append(current.strftime("%Y%m%d"))
-        current += timedelta(days=1)
-
-    if resume:
-        days = manifest.pending_keys(days)
-
-    click.echo(f"MADIS normalize: {len(days)} days, {workers} workers → {out_dir}")
-
-    if dry_run:
-        for ds in days[:10]:
-            click.echo(f"  would normalize: {ds}")
-        if len(days) > 10:
-            click.echo(f"  ... and {len(days) - 10} more")
-        return
-
-    worker = partial(
-        _madis_normalize_one,
-        raw_dir=raw_dir,
-        bounds=parsed_bounds,
-        qcr_mask=mask,
-        out_dir=str(out_dir),
-        run_id=provenance.run_id,
-        overwrite=overwrite,
-    )
-
-    done = 0
-    errors = 0
-    skipped = 0
-
-    if workers > 1:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(worker, d): d for d in days}
-            for fut in as_completed(futures):
-                day_str = futures[fut]
-                try:
-                    _, nrows, err = fut.result()
-                except Exception as exc:
-                    click.echo(f"  EXCEPTION {day_str}: {exc}")
-                    manifest.update(day_str, "failed", run_id=provenance.run_id, message=str(exc))
-                    errors += 1
-                    done += 1
-                    continue
-
-                if nrows is None:
-                    skipped += 1
-                elif err:
-                    manifest.update(day_str, "missing", run_id=provenance.run_id, message=err)
-                    errors += 1
-                else:
-                    manifest.update(day_str, "done", run_id=provenance.run_id)
-                done += 1
-
-                if done % 50 == 0:
-                    click.echo(f"  progress: {done}/{len(days)}, {skipped} skip, {errors} err")
-                    manifest.flush()
-    else:
-        for day_str in days:
-            try:
-                _, nrows, err = worker(day_str)
-            except Exception as exc:
-                click.echo(f"  EXCEPTION {day_str}: {exc}")
-                manifest.update(day_str, "failed", run_id=provenance.run_id, message=str(exc))
-                errors += 1
-                done += 1
-                continue
-
-            if nrows is None:
-                skipped += 1
-            elif err:
-                manifest.update(day_str, "missing", run_id=provenance.run_id, message=err)
-                errors += 1
-            else:
-                manifest.update(day_str, "done", run_id=provenance.run_id)
-            done += 1
-
-            if done % 50 == 0:
-                click.echo(f"  progress: {done}/{len(days)}, {skipped} skip, {errors} err")
-                manifest.flush()
-
-    manifest.flush()
-    click.echo(f"MADIS normalize done: {done} processed, {skipped} skipped, {errors} errors")
-
-
-# --------------------------------------------------------------------------- #
-# ISD implementation
-# --------------------------------------------------------------------------- #
-
-
-def _ingest_isd(start, end, raw_dir, resume, workers, dry_run):
+def _ingest_isd(start, end, raw_dir, resume, workers, dry_run, **_kw):
     """Download raw ISD files from S3 for a year range."""
     from pathlib import Path
 
@@ -425,132 +481,7 @@ def _ingest_isd(start, end, raw_dir, resume, workers, dry_run):
         manifest.flush()
 
 
-def _isd_normalize_one(key, raw_dir, out_dir, run_id, overwrite):
-    """Module-level worker for ISD normalize (picklable for ProcessPoolExecutor)."""
-    from pathlib import Path
-
-    from obsmet.core.provenance import RunProvenance
-    from obsmet.sources.isd.adapter import IsdAdapter
-
-    adapter = IsdAdapter(raw_dir=raw_dir)
-    provenance = RunProvenance(source="isd", command="normalize", run_id=run_id)
-    out_dir = Path(out_dir)
-
-    raw_path = adapter.fetch_raw(key, out_dir)
-    out_path = out_dir / key.replace("/", "_").replace(".gz", ".parquet")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists() and not overwrite:
-        return key, None, None
-    df = adapter.normalize(raw_path, provenance)
-    if df is None or df.empty:
-        return key, 0, "no data"
-    df.to_parquet(out_path, index=False, compression="snappy")
-    return key, len(df), None
-
-
-def _normalize_isd(start, end, raw_dir, out_dir, resume, workers, overwrite, dry_run):
-    """Parse ISD .gz files into canonical wide parquet."""
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    from functools import partial
-    from pathlib import Path
-
-    from obsmet.core.manifest import Manifest
-    from obsmet.core.provenance import RunProvenance
-    from obsmet.sources.isd.adapter import IsdAdapter
-
-    raw_dir = raw_dir or "/nas/climate/isd/raw"
-    out_dir = Path(out_dir) if out_dir else Path("/nas/climate/obsmet/normalized/isd")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    adapter = IsdAdapter(raw_dir=raw_dir)
-    provenance = RunProvenance(source="isd", command="normalize")
-
-    manifest_path = out_dir / "manifest.parquet"
-    manifest = Manifest(manifest_path, source="isd")
-
-    if start is None or end is None:
-        click.echo("Error: --start and --end are required for isd normalize.")
-        return
-
-    keys = adapter.discover_keys(start, end)
-    if resume:
-        keys = manifest.pending_keys(keys)
-
-    click.echo(f"ISD normalize: {len(keys)} files, {workers} workers → {out_dir}")
-
-    if dry_run:
-        for k in keys[:10]:
-            click.echo(f"  would normalize: {k}")
-        if len(keys) > 10:
-            click.echo(f"  ... and {len(keys) - 10} more")
-        return
-
-    worker = partial(
-        _isd_normalize_one,
-        raw_dir=raw_dir,
-        out_dir=str(out_dir),
-        run_id=provenance.run_id,
-        overwrite=overwrite,
-    )
-
-    done = 0
-    errors = 0
-    skipped = 0
-
-    if workers > 1:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(worker, k): k for k in keys}
-            for fut in as_completed(futures):
-                key = futures[fut]
-                try:
-                    _, nrows, err = fut.result()
-                except Exception as exc:
-                    manifest.update(key, "failed", run_id=provenance.run_id, message=str(exc))
-                    errors += 1
-                    done += 1
-                    continue
-                if nrows is None:
-                    skipped += 1
-                elif err:
-                    manifest.update(key, "missing", run_id=provenance.run_id, message=err)
-                    errors += 1
-                else:
-                    manifest.update(key, "done", run_id=provenance.run_id)
-                done += 1
-                if done % 100 == 0:
-                    click.echo(f"  progress: {done}/{len(keys)}, {skipped} skip, {errors} err")
-                    manifest.flush()
-    else:
-        for key in keys:
-            try:
-                _, nrows, err = worker(key)
-            except Exception as exc:
-                manifest.update(key, "failed", run_id=provenance.run_id, message=str(exc))
-                errors += 1
-                done += 1
-                continue
-            if nrows is None:
-                skipped += 1
-            elif err:
-                manifest.update(key, "missing", run_id=provenance.run_id, message=err)
-                errors += 1
-            else:
-                manifest.update(key, "done", run_id=provenance.run_id)
-            done += 1
-            if done % 100 == 0:
-                click.echo(f"  progress: {done}/{len(keys)}, {skipped} skip, {errors} err")
-                manifest.flush()
-
-    manifest.flush()
-    click.echo(f"ISD normalize done: {done} processed, {skipped} skipped, {errors} errors")
-
-
-# --------------------------------------------------------------------------- #
-# GDAS implementation
-# --------------------------------------------------------------------------- #
-
-
-def _ingest_gdas(start, end, raw_dir, resume, workers, dry_run):
+def _ingest_gdas(start, end, raw_dir, resume, workers, dry_run, **_kw):
     """Download GDAS PrepBUFR archives from GDEX."""
     from pathlib import Path
 
@@ -589,133 +520,7 @@ def _ingest_gdas(start, end, raw_dir, resume, workers, dry_run):
     click.echo(f"GDAS ingest done: {ok} ok, {fail} failed")
 
 
-def _gdas_normalize_one(day_str, raw_dir, out_dir, run_id, overwrite):
-    """Module-level worker for GDAS normalize (picklable for ProcessPoolExecutor)."""
-    from pathlib import Path
-
-    from obsmet.core.provenance import RunProvenance
-    from obsmet.sources.gdas_prepbufr.adapter import GdasAdapter
-
-    adapter = GdasAdapter(raw_dir=raw_dir)
-    provenance = RunProvenance(source="gdas", command="normalize", run_id=run_id)
-    out_dir = Path(out_dir)
-
-    raw_path = adapter.fetch_raw(day_str, out_dir)
-    if not raw_path.exists():
-        return day_str, 0, "raw file not found"
-    out_path = out_dir / f"{day_str}.parquet"
-    if out_path.exists() and not overwrite:
-        return day_str, None, None
-    df = adapter.normalize(raw_path, provenance)
-    if df is None or df.empty:
-        return day_str, 0, "no data"
-    df.to_parquet(out_path, index=False, compression="snappy")
-    return day_str, len(df), None
-
-
-def _normalize_gdas(start, end, raw_dir, out_dir, resume, workers, overwrite, dry_run):
-    """Extract and normalize GDAS PrepBUFR archives."""
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    from functools import partial
-    from pathlib import Path
-
-    from obsmet.core.manifest import Manifest
-    from obsmet.core.provenance import RunProvenance
-    from obsmet.sources.gdas_prepbufr.adapter import GdasAdapter
-
-    raw_dir = raw_dir or "/nas/climate/gdas/prepbufr"
-    out_dir = Path(out_dir) if out_dir else Path("/nas/climate/obsmet/normalized/gdas")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    adapter = GdasAdapter(raw_dir=raw_dir)
-    provenance = RunProvenance(source="gdas", command="normalize")
-
-    manifest_path = out_dir / "manifest.parquet"
-    manifest = Manifest(manifest_path, source="gdas")
-
-    if start is None or end is None:
-        click.echo("Error: --start and --end are required for gdas normalize.")
-        return
-
-    days = adapter.discover_keys(start, end)
-    if resume:
-        days = manifest.pending_keys(days)
-
-    click.echo(f"GDAS normalize: {len(days)} days, {workers} workers → {out_dir}")
-
-    if dry_run:
-        for ds in days[:10]:
-            click.echo(f"  would normalize: {ds}")
-        if len(days) > 10:
-            click.echo(f"  ... and {len(days) - 10} more")
-        return
-
-    worker = partial(
-        _gdas_normalize_one,
-        raw_dir=raw_dir,
-        out_dir=str(out_dir),
-        run_id=provenance.run_id,
-        overwrite=overwrite,
-    )
-
-    done = 0
-    errors = 0
-    skipped = 0
-
-    if workers > 1:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(worker, d): d for d in days}
-            for fut in as_completed(futures):
-                day_str = futures[fut]
-                try:
-                    _, nrows, err = fut.result()
-                except Exception as exc:
-                    manifest.update(day_str, "failed", run_id=provenance.run_id, message=str(exc))
-                    errors += 1
-                    done += 1
-                    continue
-                if nrows is None:
-                    skipped += 1
-                elif err:
-                    manifest.update(day_str, "missing", run_id=provenance.run_id, message=err)
-                    errors += 1
-                else:
-                    manifest.update(day_str, "done", run_id=provenance.run_id)
-                done += 1
-                if done % 50 == 0:
-                    click.echo(f"  progress: {done}/{len(days)}, {skipped} skip, {errors} err")
-                    manifest.flush()
-    else:
-        for day_str in days:
-            try:
-                _, nrows, err = worker(day_str)
-            except Exception as exc:
-                manifest.update(day_str, "failed", run_id=provenance.run_id, message=str(exc))
-                errors += 1
-                done += 1
-                continue
-            if nrows is None:
-                skipped += 1
-            elif err:
-                manifest.update(day_str, "missing", run_id=provenance.run_id, message=err)
-                errors += 1
-            else:
-                manifest.update(day_str, "done", run_id=provenance.run_id)
-            done += 1
-            if done % 50 == 0:
-                click.echo(f"  progress: {done}/{len(days)}, {skipped} skip, {errors} err")
-                manifest.flush()
-
-    manifest.flush()
-    click.echo(f"GDAS normalize done: {done} processed, {skipped} skipped, {errors} errors")
-
-
-# --------------------------------------------------------------------------- #
-# RAWS implementation
-# --------------------------------------------------------------------------- #
-
-
-def _ingest_raws(start, end, raw_dir, bounds, resume, dry_run):
+def _ingest_raws(start, end, raw_dir, bounds, resume, dry_run, **_kw):
     """Scrape RAWS WRCC inventory and download daily data."""
     from pathlib import Path
 
@@ -739,7 +544,6 @@ def _ingest_raws(start, end, raw_dir, bounds, resume, dry_run):
         click.echo("Error: --start and --end are required for raws ingest.")
         return
 
-    # Build station inventory
     click.echo("RAWS: scraping station inventory...")
     all_stations = []
     for region in REGION_PAGES:
@@ -751,7 +555,6 @@ def _ingest_raws(start, end, raw_dir, bounds, resume, dry_run):
         click.echo(f"  would download data for {len(all_stations)} stations")
         return
 
-    # Download data for each station
     ok = 0
     fail = 0
     for stn in all_stations:
@@ -780,71 +583,7 @@ def _ingest_raws(start, end, raw_dir, bounds, resume, dry_run):
     click.echo(f"RAWS ingest done: {ok} ok, {fail} failed")
 
 
-def _normalize_raws(start, end, raw_dir, out_dir, resume, overwrite, dry_run):
-    """Normalize RAWS parquet files to canonical schema."""
-    from pathlib import Path
-
-    from obsmet.core.manifest import Manifest
-    from obsmet.core.provenance import RunProvenance
-    from obsmet.sources.raws_wrcc.adapter import RawsAdapter
-
-    raw_dir = raw_dir or "/nas/climate/obsmet/raw/raws_wrcc"
-    out_dir = Path(out_dir) if out_dir else Path("/nas/climate/obsmet/normalized/raws_wrcc")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    adapter = RawsAdapter(raw_dir=raw_dir)
-    provenance = RunProvenance(source="raws_wrcc", command="normalize")
-
-    manifest_path = out_dir / "manifest.parquet"
-    manifest = Manifest(manifest_path, source="raws_wrcc")
-
-    keys = adapter.discover_keys(start, end)
-    if resume:
-        keys = manifest.pending_keys(keys)
-
-    click.echo(f"RAWS normalize: {len(keys)} stations → {out_dir}")
-
-    if dry_run:
-        for k in keys[:10]:
-            click.echo(f"  would normalize: {k}")
-        return
-
-    done = 0
-    errors = 0
-    for key in keys:
-        try:
-            raw_path = adapter.fetch_raw(key, out_dir)
-            if not raw_path.exists():
-                manifest.update(key, "missing", run_id=provenance.run_id)
-                errors += 1
-                continue
-            out_path = out_dir / f"{key}.parquet"
-            if out_path.exists() and not overwrite:
-                done += 1
-                continue
-            df = adapter.normalize(raw_path, provenance)
-            if df.empty:
-                manifest.update(key, "missing", run_id=provenance.run_id)
-                errors += 1
-            else:
-                df.to_parquet(out_path, index=False, compression="snappy")
-                manifest.update(key, "done", run_id=provenance.run_id)
-            done += 1
-        except Exception as exc:
-            manifest.update(key, "failed", run_id=provenance.run_id, message=str(exc))
-            errors += 1
-            done += 1
-
-    manifest.flush()
-    click.echo(f"RAWS normalize done: {done} processed, {errors} errors")
-
-
-# --------------------------------------------------------------------------- #
-# NDBC implementation
-# --------------------------------------------------------------------------- #
-
-
-def _ingest_ndbc(start, end, raw_dir, resume, dry_run):
+def _ingest_ndbc(start, end, raw_dir, resume, dry_run, **_kw):
     """Download NDBC stdmet files."""
     from pathlib import Path
 
@@ -898,130 +637,9 @@ def _ingest_ndbc(start, end, raw_dir, resume, dry_run):
     click.echo(f"NDBC ingest done: {ok} ok, {fail} failed/missing")
 
 
-def _ndbc_normalize_one(station_id, raw_dir, out_dir, run_id, overwrite):
-    """Module-level worker for NDBC normalize (picklable for ProcessPoolExecutor)."""
-    from pathlib import Path
-
-    from obsmet.core.provenance import RunProvenance
-    from obsmet.sources.ndbc.adapter import normalize_to_canonical_wide
-    from obsmet.sources.ndbc.extract import read_station_files
-
-    provenance = RunProvenance(source="ndbc", command="normalize", run_id=run_id)
-    out_dir = Path(out_dir)
-
-    out_path = out_dir / f"{station_id}.parquet"
-    if out_path.exists() and not overwrite:
-        return station_id, None, None
-    df = read_station_files(Path(raw_dir), station_id)
-    if df.empty:
-        return station_id, 0, "no data"
-    wide = normalize_to_canonical_wide(df, station_id, provenance)
-    wide.to_parquet(out_path, index=False, compression="snappy")
-    return station_id, len(wide), None
-
-
-def _normalize_ndbc(start, end, raw_dir, out_dir, resume, workers, overwrite, dry_run):
-    """Parse NDBC stdmet files into canonical wide parquet."""
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    from functools import partial
-    from pathlib import Path
-
-    from obsmet.core.manifest import Manifest
-    from obsmet.core.provenance import RunProvenance
-    from obsmet.sources.ndbc.adapter import NdbcAdapter
-
-    raw_dir = raw_dir or "/nas/climate/obsmet/raw/ndbc"
-    out_dir = Path(out_dir) if out_dir else Path("/nas/climate/obsmet/normalized/ndbc")
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    adapter = NdbcAdapter(raw_dir=raw_dir)
-    provenance = RunProvenance(source="ndbc", command="normalize")
-
-    manifest_path = out_dir / "manifest.parquet"
-    manifest = Manifest(manifest_path, source="ndbc")
-
-    keys = adapter.discover_keys(start, end)
-    if resume:
-        keys = manifest.pending_keys(keys)
-
-    click.echo(f"NDBC normalize: {len(keys)} stations, {workers} workers → {out_dir}")
-
-    if dry_run:
-        for k in keys[:10]:
-            click.echo(f"  would normalize: {k}")
-        return
-
-    worker = partial(
-        _ndbc_normalize_one,
-        raw_dir=raw_dir,
-        out_dir=str(out_dir),
-        run_id=provenance.run_id,
-        overwrite=overwrite,
-    )
-
-    done = 0
-    errors = 0
-    skipped = 0
-
-    if workers > 1:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(worker, k): k for k in keys}
-            for fut in as_completed(futures):
-                key = futures[fut]
-                try:
-                    _, nrows, err = fut.result()
-                except Exception as exc:
-                    manifest.update(key, "failed", run_id=provenance.run_id, message=str(exc))
-                    errors += 1
-                    done += 1
-                    continue
-                if nrows is None:
-                    skipped += 1
-                elif err:
-                    manifest.update(key, "missing", run_id=provenance.run_id, message=err)
-                    errors += 1
-                else:
-                    manifest.update(key, "done", run_id=provenance.run_id)
-                done += 1
-    else:
-        for key in keys:
-            try:
-                _, nrows, err = worker(key)
-            except Exception as exc:
-                manifest.update(key, "failed", run_id=provenance.run_id, message=str(exc))
-                errors += 1
-                done += 1
-                continue
-            if nrows is None:
-                skipped += 1
-            elif err:
-                manifest.update(key, "missing", run_id=provenance.run_id, message=err)
-                errors += 1
-            else:
-                manifest.update(key, "done", run_id=provenance.run_id)
-            done += 1
-
-    manifest.flush()
-    click.echo(f"NDBC normalize done: {done} processed, {skipped} skipped, {errors} errors")
-
-
 # --------------------------------------------------------------------------- #
 # Daily aggregation
 # --------------------------------------------------------------------------- #
-
-
-_DAILY_SOURCES = ["madis", "isd", "gdas", "ndbc"]
-
-# Variables and their aggregation type for daily rollup from hourly data
-_DAILY_AGG_MAP = {
-    "tair": "mean",
-    "td": "mean",
-    "rh": "mean",
-    "wind": "mean",
-    "wind_dir": "circular_mean",
-    "slp": "mean",
-    "prcp": "sum",
-}
 
 
 def _build_daily(source, start, end, resume, workers, overwrite, dry_run):
@@ -1031,10 +649,10 @@ def _build_daily(source, start, end, resume, workers, overwrite, dry_run):
     import pandas as pd
 
     from obsmet.core.provenance import RunProvenance
-    from obsmet.core.time_policy import circular_mean_deg, hourly_coverage
+    from obsmet.core.time_policy import DAILY_SOURCES, aggregate_daily_wide
     from obsmet.products.daily import write_daily
 
-    sources = _DAILY_SOURCES if source == "all" else [source]
+    sources = DAILY_SOURCES if source == "all" else [source]
     base_dir = Path("/nas/climate/obsmet/normalized")
     out_base = Path("/nas/climate/obsmet/products/daily")
     provenance = RunProvenance(source=source, command="build_daily")
@@ -1081,71 +699,16 @@ def _build_daily(source, start, end, resume, workers, overwrite, dry_run):
             df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
             df["date"] = df["datetime_utc"].dt.date
 
-            # Date filtering
             if start_date:
                 df = df[df["date"] >= start_date]
             if end_date:
                 df = df[df["date"] <= end_date]
 
-            if df.empty or "station_key" not in df.columns:
+            if df.empty:
                 continue
 
-            groups = df.groupby(["station_key", "date"])
-
-            daily_records = []
-            for (stn, day), grp in groups:
-                cov = hourly_coverage(grp["datetime_utc"], day)
-                cov_str = (
-                    f"n={cov['obs_count']}"
-                    f",thresh={'Y' if cov['meets_threshold'] else 'N'}"
-                    f",am={'Y' if cov['morning_ok'] else 'N'}"
-                    f",pm={'Y' if cov['afternoon_ok'] else 'N'}"
-                )
-
-                rec = {
-                    "station_key": stn,
-                    "date": day,
-                    "day_basis": "utc",
-                    "obs_count": len(grp),
-                    "coverage_flags": cov_str,
-                    "qc_state": "pass",
-                    "qc_rules_version": provenance.qaqc_rules_version,
-                    "transform_version": provenance.transform_version,
-                    "ingest_run_id": provenance.run_id,
-                }
-
-                for var, agg_type in _DAILY_AGG_MAP.items():
-                    if var not in grp.columns:
-                        continue
-                    vals = pd.to_numeric(grp[var], errors="coerce").dropna()
-                    if vals.empty:
-                        continue
-                    if agg_type == "mean":
-                        rec[var] = float(vals.mean())
-                    elif agg_type == "sum":
-                        rec[var] = float(vals.sum())
-                    elif agg_type == "circular_mean":
-                        rec[var] = circular_mean_deg(vals)
-
-                # Tmax/tmin/tmean from tair
-                if "tair" in grp.columns:
-                    tair_vals = pd.to_numeric(grp["tair"], errors="coerce").dropna()
-                    if not tair_vals.empty:
-                        rec["tmax"] = float(tair_vals.max())
-                        rec["tmin"] = float(tair_vals.min())
-                        rec["tmean"] = float(tair_vals.mean())
-
-                # Convert rsds_hourly W/m² to rsds MJ/m²/day
-                if "rsds_hourly" in grp.columns:
-                    rsds_vals = pd.to_numeric(grp["rsds_hourly"], errors="coerce").dropna()
-                    if not rsds_vals.empty:
-                        rec["rsds"] = float(rsds_vals.mean()) * 86400.0 / 1e6
-
-                daily_records.append(rec)
-
-            if daily_records:
-                daily_df = pd.DataFrame(daily_records)
-                daily_df["date"] = pd.to_datetime(daily_df["date"])
+            daily_df = aggregate_daily_wide(df, provenance)
+            if not daily_df.empty:
                 write_daily(daily_df, out_path)
 
     click.echo("Build daily done.")

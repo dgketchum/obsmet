@@ -152,6 +152,10 @@ class IsdAdapter(SourceAdapter):
         uri = f"isd://{raw_path}"
         return normalize_to_canonical_wide(df, provenance, raw_source_uri=uri)
 
+    def output_filename(self, key: str) -> str:
+        """Derive parquet filename from ISD key like '2024/720538-00164-2024.gz'."""
+        return key.replace("/", "_").replace(".gz", ".parquet")
+
     def normalize_file(
         self,
         path: Path | str,

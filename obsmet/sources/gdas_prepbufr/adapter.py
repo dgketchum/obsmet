@@ -129,6 +129,14 @@ class GdasAdapter(SourceAdapter):
                 return path
         return self.raw_dir / year / f"prepbufr.{key}.nr.tar.gz"
 
+    def normalize_key(self, key: str, provenance: RunProvenance, **kwargs) -> pd.DataFrame | None:
+        """Normalize a single GDAS day key, checking that raw file exists."""
+        dest_dir = kwargs.get("dest_dir", Path("."))
+        raw_path = self.fetch_raw(key, dest_dir)
+        if not raw_path.exists():
+            return None
+        return self.normalize(raw_path, provenance)
+
     def normalize(self, raw_path: Path, provenance: RunProvenance) -> pd.DataFrame:
         """Extract and normalize a single day's PrepBUFR tar archive."""
         from obsmet.sources.gdas_prepbufr.extract import extract_day
