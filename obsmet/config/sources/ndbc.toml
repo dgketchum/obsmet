@@ -1,0 +1,6 @@
+[ndbc]
+raw_dir = "/nas/climate/obsmet/raw/ndbc"
+station_table_url = "https://www.ndbc.noaa.gov/data/stations/station_table.txt"
+historical_url = "https://www.ndbc.noaa.gov/data/historical/stdmet"
+latest_url = "https://www.ndbc.noaa.gov/data/l_stdmet"
+sentinel_values = [99.0, 999.0, 9999.0]

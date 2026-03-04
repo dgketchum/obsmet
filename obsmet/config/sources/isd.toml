@@ -1,0 +1,6 @@
+[isd]
+raw_dir = "/nas/climate/isd/raw"
+s3_bucket = "noaa-isd-pds"
+s3_key_pattern = "data/{year}/{usaf}-{wban}-{year}.gz"
+good_qc_codes = ["1", "5"]
+por_start = "1901-01-01"

@@ -50,6 +50,11 @@ class Manifest:
         done = set(df.loc[(df["source"] == self.source) & (df["state"] == "done"), "key"])
         return [k for k in all_keys if k not in done]
 
+    def done_keys(self) -> set[str]:
+        """Return all keys with state 'done' for this source."""
+        df = self._load()
+        return set(df.loc[(df["source"] == self.source) & (df["state"] == "done"), "key"])
+
     def update(self, key: str, state: str, *, run_id: str = "", message: str = "") -> None:
         """Record or update a key's state."""
         if state not in MANIFEST_STATES:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 from enum import Enum
 
+import numpy as np
 import pandas as pd
 
 
@@ -91,6 +92,11 @@ def aggregate_daily(
         agg = grouped.min()
     elif variable in ("prcp",):
         agg = grouped.sum()
+    elif variable in ("rsds",):
+        # Convert mean instantaneous W/m² to daily MJ/m²/day
+        agg = grouped.mean() * 86400.0 / 1e6
+    elif variable in ("wind_dir",):
+        agg = grouped.apply(circular_mean_deg)
     else:
         agg = grouped.mean()
 
@@ -100,3 +106,33 @@ def aggregate_daily(
     result["obs_count"] = grouped.count().values
 
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Circular mean for angular variables
+# --------------------------------------------------------------------------- #
+
+
+def circular_mean_deg(angles: pd.Series) -> float:
+    """Compute the circular (angular) mean of a series of degree values.
+
+    Uses the atan2(mean(sin), mean(cos)) approach which correctly handles
+    wraparound (e.g. averaging 350° and 10° gives 0°, not 180°).
+
+    Parameters
+    ----------
+    angles : Series of angles in degrees.
+
+    Returns
+    -------
+    Mean angle in degrees [0, 360).
+    """
+    angles = angles.dropna()
+    if angles.empty:
+        return np.nan
+
+    rad = np.deg2rad(angles.values)
+    mean_sin = np.mean(np.sin(rad))
+    mean_cos = np.mean(np.cos(rad))
+    mean_angle = np.rad2deg(np.arctan2(mean_sin, mean_cos)) % 360
+    return float(mean_angle)

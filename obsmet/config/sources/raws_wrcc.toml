@@ -1,0 +1,7 @@
+[raws_wrcc]
+raw_dir = "/nas/climate/obsmet/raw/raws_wrcc"
+data_url = "https://wrcc.dri.edu/cgi-bin/wea_dysimts2.pl"
+base_url = "https://raws.dri.edu"
+max_chunk_years = 4
+request_delay_seconds = 2.0
+bounds = [-125.0, 24.0, -66.0, 53.0]

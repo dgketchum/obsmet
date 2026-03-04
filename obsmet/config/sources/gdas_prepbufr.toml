@@ -1,0 +1,7 @@
+[gdas_prepbufr]
+raw_dir = "/nas/climate/gdas/prepbufr"
+base_url = "https://osdf-director.osg-htc.org/ncar/gdex/d337000/tarfiles"
+msg_types = ["ADPSFC", "SFCSHP"]
+archive_start = "1997-04-30"
+good_qm_max = 3
+suspect_size_bytes = 52428800
