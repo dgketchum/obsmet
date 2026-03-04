@@ -130,6 +130,19 @@ def _normalize_one(key, source_name, raw_dir, out_dir, run_id, overwrite, adapte
     if df is None or df.empty:
         return key, 0, "no data"
 
+    from obsmet.qaqc.engines.pipeline import (
+        _VARIABLE_COLUMNS,
+        apply_pipeline_to_df,
+        build_default_pipeline,
+    )
+
+    pipeline = build_default_pipeline(source_name)
+    var_cols = _VARIABLE_COLUMNS.get(source_name, [])
+    if var_cols:
+        present = [c for c in var_cols if c in df.columns]
+        if present:
+            df = apply_pipeline_to_df(df, pipeline, present, source=source_name)
+
     df.to_parquet(out_path, index=False, compression="snappy")
     return key, len(df), None
 
@@ -257,9 +270,26 @@ def _run_normalize(
     default=None,
     help="MADIS QCR reject bitmask (default 115)",
 )
+@click.option(
+    "--qc-profile",
+    type=click.Choice(["strict", "permissive"]),
+    default=None,
+    help="QC profile (sets qcr_mask; overridden by explicit --qcr-mask)",
+)
 @common_options
 def normalize(
-    source, raw_dir, out_dir, bounds, qcr_mask, start, end, resume, workers, overwrite, dry_run
+    source,
+    raw_dir,
+    out_dir,
+    bounds,
+    qcr_mask,
+    qc_profile,
+    start,
+    end,
+    resume,
+    workers,
+    overwrite,
+    dry_run,
 ):
     """Parse raw files into canonical observation rows for SOURCE."""
     from obsmet.sources.registry import list_sources
@@ -273,8 +303,12 @@ def normalize(
     if source == "madis":
         if bounds:
             adapter_kwargs["bounds"] = tuple(float(x) for x in bounds.split(","))
+        if qc_profile is not None:
+            from obsmet.qaqc.engines.pipeline import QC_PROFILES
+
+            adapter_kwargs["qcr_mask"] = QC_PROFILES[qc_profile]["qcr_mask"]
         if qcr_mask is not None:
-            adapter_kwargs["qcr_mask"] = qcr_mask
+            adapter_kwargs["qcr_mask"] = qcr_mask  # explicit override wins
 
     _run_normalize(
         source,
@@ -304,7 +338,7 @@ def qaqc(source, start, end, resume, workers, overwrite, dry_run):
 
 
 @cli.command()
-@click.argument("product", type=click.Choice(["hourly", "daily", "fabric"]))
+@click.argument("product", type=click.Choice(["hourly", "daily", "station-por", "fabric"]))
 @click.option(
     "--source",
     default="all",
@@ -312,9 +346,11 @@ def qaqc(source, start, end, resume, workers, overwrite, dry_run):
 )
 @common_options
 def build(product, source, start, end, resume, workers, overwrite, dry_run):
-    """Build curated PRODUCT (hourly, daily, or fabric)."""
+    """Build curated PRODUCT (hourly, daily, station-por, or fabric)."""
     if product == "daily":
         _build_daily(source, start, end, resume, workers, overwrite, dry_run)
+    elif product == "station-por":
+        _build_station_por(source, start, end, resume, workers, overwrite, dry_run)
     else:
         click.echo(f"build {product}: start={start} end={end}")
 
@@ -370,6 +406,78 @@ def diag_latency(source):
 def diag_qc(source, start, end, resume, workers, overwrite, dry_run):
     """Report QC pass/fail/suspect rates."""
     click.echo(f"diagnostics qc {source}")
+
+
+# --------------------------------------------------------------------------- #
+# Release commands
+# --------------------------------------------------------------------------- #
+
+
+@cli.group()
+def release():
+    """Release management commands."""
+
+
+@release.command("build")
+@click.option("--version", required=True, help="Release version (e.g. v0.1.0)")
+@click.option("--channel", default="candidate", help="Channel name (default: candidate)")
+@click.option("--source", multiple=True, default=["madis"], help="Sources to include")
+@click.option(
+    "--qc-profile",
+    type=click.Choice(["strict", "permissive"]),
+    default=None,
+    help="QC profile used",
+)
+@click.option("--dry-run", is_flag=True, help="Show what would be done")
+def release_build(version, channel, source, qc_profile, dry_run):
+    """Build a versioned release from station POR products."""
+    from obsmet.core.provenance import RunProvenance
+    from obsmet.products.release import build_release
+
+    sources = list(source)
+    provenance = RunProvenance(source=",".join(sources), command="release_build")
+
+    if dry_run:
+        click.echo(f"Would build release {version} channel={channel} sources={sources}")
+        return
+
+    release_dir = build_release(
+        version,
+        channel,
+        sources,
+        provenance,
+        qc_profile=qc_profile or "",
+    )
+    click.echo(f"Release built: {release_dir}")
+
+
+@release.command("promote")
+@click.option("--version", required=True, help="Release version to promote")
+@click.option("--channel", default="prod", help="Target channel (default: prod)")
+def release_promote(version, channel):
+    """Promote a release to a channel after validation."""
+    from obsmet.products.release import promote_release
+
+    try:
+        promote_release(version, channel)
+        click.echo(f"Release {version} promoted to channel {channel}")
+    except ValueError as exc:
+        click.echo(f"Promotion failed: {exc}", err=True)
+
+
+@release.command("validate")
+@click.option("--version", required=True, help="Release version to validate")
+def release_validate(version):
+    """Validate a release's checksums against its manifest."""
+    from obsmet.products.release import validate_release
+
+    ok, errors = validate_release(version)
+    if ok:
+        click.echo(f"Release {version}: OK")
+    else:
+        click.echo(f"Release {version}: FAILED ({len(errors)} errors)")
+        for e in errors:
+            click.echo(f"  {e}")
 
 
 # --------------------------------------------------------------------------- #
@@ -635,6 +743,43 @@ def _ingest_ndbc(start, end, raw_dir, resume, dry_run, **_kw):
 
     manifest.flush()
     click.echo(f"NDBC ingest done: {ok} ok, {fail} failed/missing")
+
+
+# --------------------------------------------------------------------------- #
+# Station POR product
+# --------------------------------------------------------------------------- #
+
+
+def _build_station_por(source, start, end, resume, workers, overwrite, dry_run):
+    """Build station period-of-record parquets from normalized data."""
+    from pathlib import Path
+
+    from obsmet.core.provenance import RunProvenance
+    from obsmet.products.station_por import build_station_por
+
+    if source == "all":
+        sources = ["madis", "isd", "gdas", "ndbc"]
+    else:
+        sources = [source]
+
+    start_date = start.date() if start else None
+    end_date = end.date() if end else None
+
+    for src in sources:
+        norm_dir = Path(_DEFAULT_NORM_DIRS.get(src, f"/nas/climate/obsmet/normalized/{src}"))
+        out_dir = Path(f"/nas/climate/obsmet/products/station_por/{src}")
+
+        if dry_run:
+            click.echo(f"  {src}: would build station POR from {norm_dir} → {out_dir}")
+            continue
+
+        provenance = RunProvenance(source=src, command="build_station_por")
+        click.echo(f"  {src}: building station POR → {out_dir}")
+
+        stats = build_station_por(
+            src, norm_dir, out_dir, provenance, start_date=start_date, end_date=end_date
+        )
+        click.echo(f"  {src}: {len(stats)} stations written")
 
 
 # --------------------------------------------------------------------------- #
