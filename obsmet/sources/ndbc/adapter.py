@@ -112,32 +112,48 @@ class NdbcAdapter(SourceAdapter):
 
     def __init__(
         self,
-        raw_dir: str | Path = "/nas/climate/obsmet/raw/ndbc",
+        raw_dir: str | Path = "/nas/climate/ndbc/ndbc_records",
     ):
         self.raw_dir = Path(raw_dir)
 
     def discover_keys(self, start, end) -> list[str]:
-        """List station IDs that have data files in raw_dir."""
-        import re
-
-        keys = set()
-        for f in self.raw_dir.glob("*.txt.gz"):
-            m = re.match(r"(\w+)h\d{4}\.txt\.gz", f.name)
-            if m:
-                keys.add(m.group(1).upper())
-        return sorted(keys)
+        """List station IDs from parquet files in raw_dir."""
+        keys = []
+        for f in sorted(self.raw_dir.glob("*.parquet")):
+            keys.append(f.stem.upper())
+        return keys
 
     def fetch_raw(self, key: str, dest_dir: Path) -> Path:
-        """Return path to raw directory for a station key."""
-        return self.raw_dir
+        """Return path to raw parquet for a station key."""
+        return self.raw_dir / f"{key.lower()}.parquet"
 
     def normalize_key(self, key: str, provenance: RunProvenance, **kwargs) -> pd.DataFrame | None:
-        """Normalize a single NDBC station key."""
-        from obsmet.sources.ndbc.extract import read_station_files
+        """Normalize a single NDBC station from pre-existing parquet."""
+        raw_path = self.raw_dir / f"{key.lower()}.parquet"
+        if not raw_path.exists():
+            return None
 
-        df = read_station_files(self.raw_dir, key)
+        df = pd.read_parquet(raw_path)
         if df.empty:
             return None
+
+        # The on-disk parquet has a tz-naive DatetimeIndex — reset and localize
+        if df.index.name is not None or not isinstance(df.index, pd.RangeIndex):
+            df = df.reset_index()
+            # The index becomes a column; rename to datetime_utc
+            idx_col = [
+                c for c in df.columns if "date" in str(c).lower() or "time" in str(c).lower()
+            ]
+            if idx_col:
+                df = df.rename(columns={idx_col[0]: "datetime_utc"})
+
+        if "datetime_utc" not in df.columns:
+            # Try first column as datetime
+            first_col = df.columns[0]
+            df = df.rename(columns={first_col: "datetime_utc"})
+
+        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+
         return normalize_to_canonical_wide(df, key, provenance)
 
     def output_filename(self, key: str) -> str:
@@ -145,14 +161,25 @@ class NdbcAdapter(SourceAdapter):
         return f"{key}.parquet"
 
     def normalize(self, raw_path: Path, provenance: RunProvenance) -> pd.DataFrame:
-        """Read and normalize a station's stdmet files."""
-        from obsmet.sources.ndbc.extract import read_station_files
-
-        # Determine station ID from filename pattern
-        station_id = raw_path.stem.split("h")[0].upper() if "h" in raw_path.stem else raw_path.stem
-        df = read_station_files(raw_path.parent, station_id)
+        """Read and normalize a station's parquet file."""
+        station_id = raw_path.stem.upper()
+        df = pd.read_parquet(raw_path)
         if df.empty:
             return pd.DataFrame()
+
+        if df.index.name is not None or not isinstance(df.index, pd.RangeIndex):
+            df = df.reset_index()
+            idx_col = [
+                c for c in df.columns if "date" in str(c).lower() or "time" in str(c).lower()
+            ]
+            if idx_col:
+                df = df.rename(columns={idx_col[0]: "datetime_utc"})
+
+        if "datetime_utc" not in df.columns:
+            first_col = df.columns[0]
+            df = df.rename(columns={first_col: "datetime_utc"})
+
+        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
 
         uri = f"ndbc://{raw_path}"
         return normalize_to_canonical_wide(df, station_id, provenance, raw_source_uri=uri)

@@ -30,19 +30,19 @@ def cli():
 # --------------------------------------------------------------------------- #
 
 _DEFAULT_RAW_DIRS = {
-    "madis": "/nas/climate/obsmet/raw/madis",
+    "madis": "/nas/climate/madis/LDAD/mesonet/netCDF",
     "isd": "/nas/climate/isd/raw",
     "gdas": "/nas/climate/gdas/prepbufr",
-    "raws": "/nas/climate/obsmet/raw/raws_wrcc",
-    "ndbc": "/nas/climate/obsmet/raw/ndbc",
+    "raws": "/nas/climate/raws/wrcc/station_data",
+    "ndbc": "/nas/climate/ndbc/ndbc_records",
 }
 
 _DEFAULT_NORM_DIRS = {
-    "madis": "/nas/climate/obsmet/normalized/madis",
-    "isd": "/nas/climate/obsmet/normalized/isd",
-    "gdas": "/nas/climate/obsmet/normalized/gdas",
-    "raws": "/nas/climate/obsmet/normalized/raws_wrcc",
-    "ndbc": "/nas/climate/obsmet/normalized/ndbc",
+    "madis": "/mnt/mco_nas1/shared/obsmet/normalized/madis",
+    "isd": "/mnt/mco_nas1/shared/obsmet/normalized/isd",
+    "gdas": "/mnt/mco_nas1/shared/obsmet/normalized/gdas",
+    "raws": "/mnt/mco_nas1/shared/obsmet/normalized/raws_wrcc",
+    "ndbc": "/mnt/mco_nas1/shared/obsmet/normalized/ndbc",
 }
 
 # Manifest source names (some differ from CLI source name)
@@ -767,7 +767,7 @@ def _build_station_por(source, start, end, resume, workers, overwrite, dry_run):
 
     for src in sources:
         norm_dir = Path(_DEFAULT_NORM_DIRS.get(src, f"/nas/climate/obsmet/normalized/{src}"))
-        out_dir = Path(f"/nas/climate/obsmet/products/station_por/{src}")
+        out_dir = Path(f"/mnt/mco_nas1/shared/obsmet/products/station_por/{src}")
 
         if dry_run:
             click.echo(f"  {src}: would build station POR from {norm_dir} → {out_dir}")
@@ -798,8 +798,8 @@ def _build_daily(source, start, end, resume, workers, overwrite, dry_run):
     from obsmet.products.daily import write_daily
 
     sources = DAILY_SOURCES if source == "all" else [source]
-    base_dir = Path("/nas/climate/obsmet/normalized")
-    out_base = Path("/nas/climate/obsmet/products/daily")
+    base_dir = Path("/mnt/mco_nas1/shared/obsmet/normalized")
+    out_base = Path("/mnt/mco_nas1/shared/obsmet/products/daily")
     provenance = RunProvenance(source=source, command="build_daily")
 
     start_date = start.date() if start else None

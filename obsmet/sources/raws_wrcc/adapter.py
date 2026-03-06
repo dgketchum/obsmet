@@ -103,29 +103,30 @@ class RawsAdapter(SourceAdapter):
 
     def __init__(
         self,
-        raw_dir: str | Path = "/nas/climate/obsmet/raw/raws_wrcc",
+        raw_dir: str | Path = "/nas/climate/raws/wrcc/station_data",
     ):
         self.raw_dir = Path(raw_dir)
 
     def discover_keys(self, start, end) -> list[str]:
-        """List station parquet files available in raw_dir.
+        """List station CSV files available in raw_dir.
 
         Keys are station WRCC IDs derived from filenames.
         """
         keys = []
-        for f in sorted(self.raw_dir.glob("*.parquet")):
+        for f in sorted(self.raw_dir.glob("*.csv")):
             keys.append(f.stem)
         return keys
 
     def fetch_raw(self, key: str, dest_dir: Path) -> Path:
-        """Return path to raw parquet for a station key."""
-        return self.raw_dir / f"{key}.parquet"
+        """Return path to raw CSV for a station key."""
+        return self.raw_dir / f"{key}.csv"
 
     def normalize(self, raw_path: Path, provenance: RunProvenance) -> pd.DataFrame:
-        """Read and normalize a single station's raw parquet."""
+        """Read and normalize a single station's raw CSV."""
         wrcc_id = raw_path.stem
-        df = pd.read_parquet(raw_path)
+        df = pd.read_csv(raw_path)
         if df.empty:
             return pd.DataFrame()
 
+        df["date"] = pd.to_datetime(df["date"])
         return normalize_to_canonical_wide(df, wrcc_id, provenance)

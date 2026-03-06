@@ -130,7 +130,22 @@ class GdasAdapter(SourceAdapter):
         return self.raw_dir / year / f"prepbufr.{key}.nr.tar.gz"
 
     def normalize_key(self, key: str, provenance: RunProvenance, **kwargs) -> pd.DataFrame | None:
-        """Normalize a single GDAS day key, checking that raw file exists."""
+        """Normalize a single GDAS day key.
+
+        Fast path: if pre-extracted parquet exists at
+        raw_dir/parquet/YYYY/YYYYMMDD.parquet, read it directly instead
+        of decoding BUFR. Falls back to BUFR decode if not found.
+        """
+        year = key[:4]
+        parquet_path = self.raw_dir / "parquet" / year / f"{key}.parquet"
+        if parquet_path.exists():
+            df = pd.read_parquet(parquet_path)
+            if not df.empty:
+                if "datetime" in df.columns and "datetime_utc" not in df.columns:
+                    df = df.rename(columns={"datetime": "datetime_utc"})
+                df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+                return normalize_to_canonical_wide(df, provenance, raw_source_uri=str(parquet_path))
+
         dest_dir = kwargs.get("dest_dir", Path("."))
         raw_path = self.fetch_raw(key, dest_dir)
         if not raw_path.exists():

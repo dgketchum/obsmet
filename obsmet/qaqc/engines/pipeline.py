@@ -68,7 +68,7 @@ _VARIABLE_COLUMNS: dict[str, list[str]] = {
     "madis": ["tair", "td", "rh", "wind", "wind_dir", "prcp", "rsds_hourly"],
     "isd": ["tair", "td", "wind", "wind_dir", "slp", "prcp"],
     "gdas": ["tair", "td", "wind", "wind_dir", "psfc"],
-    "raws": ["tair", "td", "rh", "wind", "wind_dir", "prcp", "rsds_hourly"],
+    "raws": ["tmean", "tmax", "tmin", "wind", "wind_dir", "rh", "prcp", "rsds"],
     "ndbc": ["tair", "td", "wind", "wind_dir", "slp"],
 }
 

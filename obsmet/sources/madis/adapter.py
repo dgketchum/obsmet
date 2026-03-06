@@ -260,7 +260,7 @@ class MadisAdapter(SourceAdapter):
 
     def __init__(
         self,
-        raw_dir: str | Path = "/nas/climate/obsmet/raw/madis",
+        raw_dir: str | Path = "/nas/climate/madis/LDAD/mesonet/netCDF",
         bounds: tuple[float, float, float, float] | None = None,
         qcr_mask: int = QCR_REJECT_BITS,
     ):
