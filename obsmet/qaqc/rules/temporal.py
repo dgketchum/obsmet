@@ -1,11 +1,26 @@
-"""Tier 2: Temporal QC rules for station-level time-series checks."""
+"""Tier 2: Temporal QC rules for station-level time-series checks.
+
+Uses agweather-qaqc (Dunkerly et al., 2024) for core algorithms:
+- Modified z-score outlier detection per station-variable-month
+- RH yearly percentile drift correction
+- Rs period-ratio correction with spike detection
+"""
 
 from __future__ import annotations
 
+import io
+import os
+from contextlib import redirect_stdout
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+
+from agweatherqaqc.qaqc_functions import (
+    modified_z_score_outlier_detection,
+    rh_yearly_percentile_corr,
+    rs_period_ratio_corr,
+)
 
 from obsmet.qaqc.rules.base import QCResult, QCRule, QCTier
 
@@ -19,14 +34,14 @@ from obsmet.qaqc.rules.base import QCResult, QCRule, QCTier
 class MonthlyZScoreRule(QCRule):
     """Flag outliers using modified z-score per station-variable-month.
 
-    Uses MAD (median absolute deviation) for robust outlier detection.
-    Modified z = 0.6745 * (x - median) / MAD.
-    |z| > 3.5 → suspect, |z| > 7.0 → fail.
+    Delegates to agweather-qaqc's ``modified_z_score_outlier_detection``
+    (Iglewicz & Hoaglin, 1993; threshold = 3.5).
+    Adds a second fail tier at z > 7.0.
     """
 
     tier: QCTier = QCTier.TEMPORAL
     name: str = "monthly_zscore"
-    version: str = "1"
+    version: str = "2"
     suspect_threshold: float = 3.5
     fail_threshold: float = 7.0
     min_obs_per_month: int = 90
@@ -69,7 +84,8 @@ class MonthlyZScoreRule(QCRule):
     ) -> pd.Series:
         """Vectorized check on a station's time series.
 
-        Returns Series of state strings aligned with input index.
+        Uses agweather-qaqc's modified_z_score_outlier_detection per month
+        for the 3.5 suspect tier, then computes z-scores for the 7.0 fail tier.
         """
         result = pd.Series("pass", index=series.index)
         valid = series.dropna()
@@ -86,20 +102,22 @@ class MonthlyZScoreRule(QCRule):
             mask = months == month
             vals = valid[mask]
             if len(vals) < self.min_obs_per_month:
-                # Fall back to annual stats
-                med = valid.median()
-                mad = np.median(np.abs(valid - med))
-            else:
-                med = vals.median()
-                mad = np.median(np.abs(vals - med))
-
-            if mad == 0:
                 continue
 
-            z = 0.6745 * np.abs(vals - med) / mad
+            data = vals.values.copy()
+
+            # agweather-qaqc flags |z| > 3.5 by setting values to NaN
+            cleaned, _ = modified_z_score_outlier_detection(data)
+            flagged_35 = ~np.isnan(data) & np.isnan(cleaned)
+            result.loc[vals.index[flagged_35]] = "suspect"
+
+            # Extend to fail tier (z > 7.0)
+            med = np.nanmedian(data)
+            mad = np.nanmedian(np.abs(data - med))
+            if mad == 0:
+                continue
+            z = 0.6745 * np.abs(data - med) / mad
             result.loc[vals.index[z > self.fail_threshold]] = "fail"
-            suspect_mask = (z > self.suspect_threshold) & (z <= self.fail_threshold)
-            result.loc[vals.index[suspect_mask]] = "suspect"
 
         return result
 
@@ -277,4 +295,170 @@ class StuckSensorRule(QCRule):
 
         stuck = run_lengths >= self.min_run_length
         result.loc[stuck.index[stuck]] = "suspect"
+        return result
+
+
+# --------------------------------------------------------------------------- #
+# RH Drift Rule (agweather-qaqc yearly percentile correction)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class RHDriftRule(QCRule):
+    """Detect humidity sensor drift via yearly percentile correction.
+
+    Wraps agweather-qaqc's ``rh_yearly_percentile_corr`` which assumes that
+    RHmax should reach ~100% at least once per year in agricultural areas.
+    The multiplicative correction factor per year indicates sensor drift;
+    days in years with large corrections are flagged.
+    """
+
+    tier: QCTier = QCTier.TEMPORAL
+    name: str = "rh_drift"
+    version: str = "1"
+    percentage: int = 1
+    suspect_corr_factor: float = 1.05
+    fail_corr_factor: float = 1.15
+
+    def check(self, value: float, **context) -> QCResult:
+        """Single-value interface (not meaningful for this rule)."""
+        return QCResult(
+            state="pass", reason="rh_drift_no_context", tier=self.tier, rule_name=self.name
+        )
+
+    def check_series(
+        self,
+        rhmax: pd.Series,
+        rhmin: pd.Series,
+        years: pd.Series,
+    ) -> pd.Series:
+        """Flag days in years where RH sensor drift exceeds thresholds.
+
+        Parameters
+        ----------
+        rhmax, rhmin : pd.Series
+            Daily max/min relative humidity (aligned index).
+        years : pd.Series
+            Year for each observation (aligned index).
+        """
+        result = pd.Series("pass", index=rhmax.index)
+        rh_max_arr = rhmax.values.astype(np.float64).copy()
+        rh_min_arr = rhmin.values.astype(np.float64).copy()
+        year_arr = years.values.astype(np.int32)
+
+        n = len(rh_max_arr)
+        if n < 365:
+            return result
+
+        log_buf = io.StringIO()
+        with redirect_stdout(io.StringIO()):
+            corr_rhmax, _ = rh_yearly_percentile_corr(
+                log_buf, 0, n, rh_max_arr, rh_min_arr, year_arr, self.percentage
+            )
+
+        # Compute per-year correction factor: corr / original
+        unique_years = np.unique(year_arr)
+        for yr in unique_years:
+            yr_mask = year_arr == yr
+            orig_vals = rh_max_arr[yr_mask]
+            corr_vals = corr_rhmax[yr_mask]
+
+            valid = ~np.isnan(orig_vals) & ~np.isnan(corr_vals) & (orig_vals > 0)
+            if not np.any(valid):
+                continue
+
+            factors = corr_vals[valid] / orig_vals[valid]
+            mean_factor = np.nanmean(factors)
+
+            yr_idx = rhmax.index[yr_mask]
+            if mean_factor >= self.fail_corr_factor or mean_factor <= (1 / self.fail_corr_factor):
+                result.loc[yr_idx] = "fail"
+            elif mean_factor >= self.suspect_corr_factor or mean_factor <= (
+                1 / self.suspect_corr_factor
+            ):
+                result.loc[yr_idx] = "suspect"
+
+        return result
+
+
+# --------------------------------------------------------------------------- #
+# Rs Period Ratio Rule (agweather-qaqc period-ratio correction)
+# --------------------------------------------------------------------------- #
+
+_DEFAULT_RSUN_PATH = os.path.join("/nas", "dads", "mvp", "rsun_pnw_1km.tif")
+
+
+@dataclass
+class RsPeriodRatioRule(QCRule):
+    """Detect solar radiation spikes and drift via period-ratio correction.
+
+    Wraps agweather-qaqc's ``rs_period_ratio_corr`` which compares observed Rs
+    to clear-sky Rso in configurable windows, identifying spikes via a two-rule
+    test (2% correction-factor sensitivity + 75 W/m² absolute excess).
+
+    Rso is extracted from pre-computed RSUN terrain-corrected rasters rather
+    than the flat-earth refet calculation used natively by agweather-qaqc.
+    """
+
+    tier: QCTier = QCTier.TEMPORAL
+    name: str = "rs_period_ratio"
+    version: str = "1"
+    period: int = 60
+    sample_size: int = 6
+
+    def check(self, value: float, **context) -> QCResult:
+        """Single-value interface (not meaningful for this rule)."""
+        return QCResult(
+            state="pass", reason="rs_ratio_no_context", tier=self.tier, rule_name=self.name
+        )
+
+    def check_series(
+        self,
+        rs: pd.Series,
+        rso: np.ndarray,
+        doy: pd.Series,
+    ) -> pd.Series:
+        """Flag days where Rs correction indicates spikes or severe drift.
+
+        Parameters
+        ----------
+        rs : pd.Series
+            Daily observed solar radiation in W/m² (aligned index).
+        rso : np.ndarray
+            365-element clear-sky array from RSUN (W/m²), indexed by DOY-1.
+        doy : pd.Series
+            Day-of-year for each observation (1-365, aligned index).
+        """
+        result = pd.Series("pass", index=rs.index)
+        rs_arr = rs.values.astype(np.float64).copy()
+        n = len(rs_arr)
+        if n < self.period:
+            return result
+
+        # Build per-day Rso from DOY lookup
+        rso_arr = rso[(doy.values.astype(int) - 1) % 365].astype(np.float64)
+
+        log_buf = io.StringIO()
+        with redirect_stdout(io.StringIO()):
+            corr_rs, _ = rs_period_ratio_corr(
+                log_buf, 0, n, rs_arr, rso_arr, self.sample_size, self.period
+            )
+
+        # Days where the value was replaced (spike detection marker -12345 → set to Rso*1.05)
+        # or NaN'd (insufficient data / extreme correction factor) → fail
+        was_valid = ~np.isnan(rs_arr)
+        now_nan = np.isnan(corr_rs)
+        removed = was_valid & now_nan
+        result.loc[rs.index[removed]] = "fail"
+
+        # Days that were significantly corrected (>10% change) → suspect
+        both_valid = was_valid & ~now_nan & (rs_arr > 0)
+        if np.any(both_valid):
+            change = np.abs(corr_rs[both_valid] - rs_arr[both_valid]) / rs_arr[both_valid]
+            sig_change = np.zeros(n, dtype=bool)
+            sig_change[both_valid] = change > 0.10
+            # Don't downgrade fail to suspect
+            suspect_only = sig_change & (result.values != "fail")
+            result.loc[rs.index[suspect_only]] = "suspect"
+
         return result

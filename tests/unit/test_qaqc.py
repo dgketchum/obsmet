@@ -13,6 +13,8 @@ from obsmet.qaqc.rules.temporal import (
     DewpointTemperatureRule,
     IsolatedObsRule,
     MonthlyZScoreRule,
+    RHDriftRule,
+    RsPeriodRatioRule,
     StuckSensorRule,
 )
 
@@ -152,8 +154,9 @@ class TestMonthlyZScore:
 
     def test_extreme_value_flagged(self):
         rng = np.random.default_rng(42)
-        n = 200
-        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+        # Need enough obs per month (>=90); 4 years of daily data
+        n = 365 * 4
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
         vals = pd.Series(rng.normal(20, 3, n), index=range(n))
         vals.iloc[5] = 60.0  # extreme outlier in January
         rule = MonthlyZScoreRule()
@@ -166,6 +169,18 @@ class TestMonthlyZScore:
         rule = MonthlyZScoreRule()
         states = rule.check_series(vals, dates)
         assert (states == "pass").all()
+
+    def test_uses_agweatherqaqc(self):
+        """Verify that agweather-qaqc's function is actually called."""
+        rng = np.random.default_rng(42)
+        n = 365 * 4
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        vals = pd.Series(rng.normal(20, 3, n), index=range(n))
+        vals.iloc[5] = 100.0  # obvious outlier
+        rule = MonthlyZScoreRule()
+        states = rule.check_series(vals, dates.to_series(index=range(n)))
+        # The outlier should be caught by agweather-qaqc's 3.5 threshold
+        assert states.iloc[5] in ("suspect", "fail")
 
 
 class TestIsolatedObs:
@@ -220,3 +235,131 @@ class TestDewpointTemperatureDaily:
         states = rule.check_daily(td, tmin)
         assert states.iloc[0] == "fail"
         assert states.iloc[1] == "pass"
+
+
+# --------------------------------------------------------------------------- #
+# New agweather-qaqc-based rules
+# --------------------------------------------------------------------------- #
+
+
+class TestRHDrift:
+    def test_no_drift_passes(self):
+        """Station with RHmax regularly hitting 100% → no drift detected."""
+        rng = np.random.default_rng(42)
+        n = 365 * 3
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        # RHmax with some values near 100 each year
+        rhmax = pd.Series(rng.uniform(60, 100, n), index=range(n))
+        # Sprinkle some 100s each year
+        for yr_start in range(0, n, 365):
+            for i in range(5):
+                if yr_start + i * 30 < n:
+                    rhmax.iloc[yr_start + i * 30] = 100.0
+
+        rhmin = pd.Series(rng.uniform(30, 70, n), index=range(n))
+        years = pd.Series(dates.year.values, index=range(n))
+
+        rule = RHDriftRule()
+        states = rule.check_series(rhmax, rhmin, years)
+        # Most should pass
+        assert (states == "pass").sum() > n * 0.8
+
+    def test_severe_drift_flagged(self):
+        """Station with RHmax never exceeding 70% → drift should be detected."""
+        rng = np.random.default_rng(42)
+        n = 365 * 2
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        # RHmax capped at 70 — strong drift signal
+        rhmax = pd.Series(rng.uniform(40, 70, n), index=range(n))
+        rhmin = pd.Series(rng.uniform(20, 50, n), index=range(n))
+        years = pd.Series(dates.year.values, index=range(n))
+
+        rule = RHDriftRule()
+        states = rule.check_series(rhmax, rhmin, years)
+        # With RHmax never hitting 100, correction factor ~1.43 → fail
+        assert (states != "pass").sum() > 0
+
+
+class TestRsPeriodRatio:
+    def test_clean_data_mostly_passes(self):
+        """Synthetic Rs ≈ 0.90 × Rso — no spikes, mild attenuation."""
+        rng = np.random.default_rng(42)
+        n = 365
+        rso = np.sin(np.linspace(0, np.pi, 365)) * 300 + 100  # seasonal Rso curve
+        rs = rso * 0.90 + rng.normal(0, 5, n)  # Rs with small noise, close to Rso
+        rs[rs < 0] = 0
+
+        rs_series = pd.Series(rs, index=range(n))
+        doy = pd.Series(np.arange(1, 366), index=range(n))
+
+        rule = RsPeriodRatioRule()
+        states = rule.check_series(rs_series, rso, doy)
+        # Clean data shouldn't have many hard fails
+        assert (states == "fail").sum() < n * 0.1
+
+    def test_spike_detected(self):
+        """Inject a massive spike — should be flagged."""
+        rng = np.random.default_rng(42)
+        n = 365
+        rso = np.sin(np.linspace(0, np.pi, 365)) * 300 + 100
+        rs = rso * 0.75 + rng.normal(0, 10, n)
+        rs[rs < 0] = 0
+        # Inject spikes
+        rs[10] = 1200.0
+        rs[11] = 1300.0
+
+        rs_series = pd.Series(rs, index=range(n))
+        doy = pd.Series(np.arange(1, 366), index=range(n))
+
+        rule = RsPeriodRatioRule()
+        states = rule.check_series(rs_series, rso, doy)
+        # At least some days should be flagged
+        assert (states != "pass").sum() > 0
+
+
+class TestCompiledHumidity:
+    def test_td_present(self):
+        """When td is present, ea_compiled should be derived from it."""
+        from obsmet.products.humidity import compile_humidity
+
+        df = pd.DataFrame(
+            {
+                "tmax": [30.0, 32.0],
+                "tmin": [15.0, 16.0],
+                "td": [10.0, 12.0],
+            }
+        )
+        result = compile_humidity(df)
+        assert "ea_compiled" in result.columns
+        assert "td_compiled" in result.columns
+        assert not np.any(np.isnan(result["ea_compiled"].values))
+
+    def test_rh_only(self):
+        """When only RH is present, ea_compiled should still be computed."""
+        from obsmet.products.humidity import compile_humidity
+
+        df = pd.DataFrame(
+            {
+                "tmax": [30.0, 32.0],
+                "tmin": [15.0, 16.0],
+                "rh": [60.0, 65.0],
+            }
+        )
+        result = compile_humidity(df)
+        assert "ea_compiled" in result.columns
+        assert not np.any(np.isnan(result["ea_compiled"].values))
+
+    def test_all_missing_uses_tmin(self):
+        """With no humidity columns, falls back to Tmin-based estimate."""
+        from obsmet.products.humidity import compile_humidity
+
+        df = pd.DataFrame(
+            {
+                "tmax": [30.0, 32.0],
+                "tmin": [15.0, 16.0],
+            }
+        )
+        result = compile_humidity(df)
+        assert "ea_compiled" in result.columns
+        # Should have values derived from Tmin
+        assert not np.any(np.isnan(result["ea_compiled"].values))

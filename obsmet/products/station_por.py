@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from obsmet.core.manifest import Manifest
@@ -17,6 +18,8 @@ from obsmet.core.time_policy import aggregate_daily_wide
 from obsmet.qaqc.rules.temporal import (
     DewpointTemperatureRule,
     MonthlyZScoreRule,
+    RHDriftRule,
+    RsPeriodRatioRule,
     StuckSensorRule,
 )
 
@@ -32,16 +35,26 @@ def _worst_state(a: str, b: str) -> str:
 def _apply_tier2_qc(
     station_df: pd.DataFrame,
     variable_columns: list[str],
+    *,
+    rso: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Apply Tier 2 temporal QC to a single station's daily DataFrame.
 
     Runs MonthlyZScoreRule and StuckSensorRule on each variable column,
-    plus DewpointTemperatureRule cross-variable (td vs tmin).
+    DewpointTemperatureRule cross-variable (td vs tmin),
+    RHDriftRule on rhmax/rhmin, and RsPeriodRatioRule on rsds (if Rso provided).
     Merges with existing qc_state (worst wins).
+
+    Parameters
+    ----------
+    rso : np.ndarray, optional
+        365-element RSUN clear-sky array (W/m²) for Rs period-ratio correction.
     """
     zscore_rule = MonthlyZScoreRule()
     stuck_rule = StuckSensorRule(min_run_length=5)  # daily threshold
     td_rule = DewpointTemperatureRule()
+    rh_drift_rule = RHDriftRule()
+    rs_ratio_rule = RsPeriodRatioRule()
 
     if "date" not in station_df.columns:
         return station_df
@@ -85,6 +98,29 @@ def _apply_tier2_qc(
                 pos = station_df.index.get_loc(idx)
                 tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
                 tier2_reasons[pos].append("td_exceeds_tmin_daily")
+
+    # RH drift (yearly percentile correction)
+    if "rh" in station_df.columns:
+        rhmax = pd.to_numeric(station_df["rh"], errors="coerce")
+        rhmin = rhmax.copy()  # MADIS reports single RH; use as both max/min
+        years = dates.dt.year
+        rh_states = rh_drift_rule.check_series(rhmax, rhmin, years)
+        for idx, st in rh_states.items():
+            if st != "pass":
+                pos = station_df.index.get_loc(idx)
+                tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
+                tier2_reasons[pos].append("rh_drift")
+
+    # Rs period-ratio correction (requires RSUN Rso)
+    if rso is not None and "rsds" in station_df.columns:
+        rs_vals = pd.to_numeric(station_df["rsds"], errors="coerce")
+        doy = dates.dt.dayofyear
+        rs_states = rs_ratio_rule.check_series(rs_vals, rso, doy)
+        for idx, st in rs_states.items():
+            if st != "pass":
+                pos = station_df.index.get_loc(idx)
+                tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
+                tier2_reasons[pos].append("rs_period_ratio")
 
     # Merge with existing qc_state
     station_df = station_df.copy()

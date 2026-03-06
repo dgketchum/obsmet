@@ -11,6 +11,8 @@ obsmet applies quality control in two distinct phases:
 2. **Pipeline audit** (Tier 2) — applied when building station period-of-record products. These
    are temporal/statistical checks that require context beyond a single observation — a station's
    monthly distribution, consecutive-value runs, cross-variable consistency over daily windows.
+   The Tier 2 methods are adapted from [agweather-qaqc](https://github.com/WSWUP/agweather-qaqc)
+   (Dunkerly et al., 2024).
 
 This separation exists because Tier 2 rules need aggregated data that doesn't exist at
 extract time, and because keeping Tier 0–1 in the normalization step means that even raw
@@ -183,6 +185,49 @@ smooth out transient exceedances.
 data recording artifacts rather than genuine measurements.
 
 **Note:** This rule applies only to hourly data and is not meaningful for daily series.
+
+### RHDriftRule
+
+**What it detects:** Slow humidity sensor drift causing RHmax to systematically under-report.
+
+**How it works:** Wraps agweather-qaqc's `rh_yearly_percentile_corr`. Assumes that in
+agricultural areas, RHmax should reach ~100% at least once per year (e.g., rain events).
+For each year, computes a multiplicative correction factor from the top 1% of RHmax values.
+The magnitude of the correction indicates drift severity.
+
+**Thresholds:**
+
+| Correction factor | Action |
+|-------------------|--------|
+| 1.05–1.15 (or reciprocal) | Flag year as suspect |
+| > 1.15 (or reciprocal) | Flag year as fail |
+| < 1.05 | Pass (sensor operating normally) |
+
+**Requirements:** At least 365 days of data for meaningful yearly percentile calculation.
+
+### RsPeriodRatioRule
+
+**What it detects:** Solar radiation spikes (electrical shorts, datalogger errors) and
+sensor drift causing systematic over- or under-reporting of Rs.
+
+**How it works:** Wraps agweather-qaqc's `rs_period_ratio_corr`. Divides the station record
+into 60-day periods and computes a correction factor (Rso/Rs) from the 6 largest Rs/Rso
+ratios per period. Two rules detect spikes within each period:
+
+1. **Sensitivity rule:** Removing any single ratio shifts the correction factor by >2%.
+2. **Absolute rule:** Average Rs exceeds average Rso by ≥75 W/m².
+
+Clear-sky Rso comes from pre-computed RSUN terrain-corrected rasters (GRASS r.sun +
+r.horizon) rather than the flat-earth refet Rso that agweather-qaqc uses natively.
+
+**Thresholds:**
+
+| Condition | Action |
+|-----------|--------|
+| Value removed by spike detector or insufficient data | fail |
+| Correction changes value by >10% | suspect |
+| Correction factor outside 0.50–1.50 | fail (period removed) |
+| Correction factor within 0.97–1.03 | pass (no correction needed) |
 
 ## QC Profiles
 
