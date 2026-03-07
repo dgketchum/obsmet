@@ -63,8 +63,13 @@ extra_javascript:
 nav:
   - Home: index.md
   - Overview: overview.md
-  - MADIS Pipeline:
-    - Data Source: madis/index.md
-    - Workflow: madis/workflow.md
-    - Quality Control: madis/qaqc.md
+  - Sources:
+    - MADIS:
+      - Data Source: madis/index.md
+      - Workflow: madis/workflow.md
+      - Quality Control: madis/qaqc.md
+    - ISD: isd.md
+    - GDAS: gdas.md
+    - RAWS: raws.md
+    - NDBC: ndbc.md
   - CLI Reference: cli_reference.md

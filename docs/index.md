@@ -17,13 +17,19 @@ for surface meteorological observations.
 |--------|---------|----------|--------|
 | **MADIS** | NOAA ESRL mesonet (LDAD tier) | 2001–present, hourly | Active |
 | **ISD** | NOAA Integrated Surface Database | 1901–present, hourly | Active |
-| **GDAS** | NCEP Global Data Assimilation System (ADPSFC/SFCSHP) | 2004–present, 6-hourly | Active |
-| **RAWS** | Remote Automatic Weather Stations (WRCC) | 1980s–present, hourly | Active |
+| **GDAS** | NCEP Global Data Assimilation System (ADPSFC/SFCSHP) | 1997–present, 6-hourly | Active |
+| **RAWS** | Remote Automatic Weather Stations (WRCC) | 1980s–present, daily | Active |
 | **NDBC** | National Data Buoy Center | 1970s–present, hourly | Active |
 
 ## Quick Links
 
 - [Architecture Overview](overview.md) — the 5-layer pipeline and design principles
-- [MADIS Pipeline](madis/index.md) — end-to-end workflow for MADIS observations
-- [Quality Control](madis/qaqc.md) — the tiered QC system explained
 - [CLI Reference](cli_reference.md) — all commands, flags, and example invocations
+
+### Source Documentation
+
+- [MADIS](madis/index.md) — NOAA mesonet observations ([workflow](madis/workflow.md), [QC](madis/qaqc.md))
+- [ISD](isd.md) — Integrated Surface Database
+- [GDAS](gdas.md) — Global Data Assimilation System PrepBUFR
+- [RAWS](raws.md) — Remote Automatic Weather Stations (WRCC)
+- [NDBC](ndbc.md) — National Data Buoy Center

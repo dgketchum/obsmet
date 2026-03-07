@@ -64,7 +64,7 @@ requirements, file naming conventions, and failure modes. Layer A isolates all o
 a common manifest-driven interface with resume semantics — if a download is interrupted, it
 picks up where it left off.
 
-**Outputs:** Raw files (netCDF, CSV, BUFR) under `/nas/climate/obsmet/raw/<source>/`
+**Outputs:** Raw files (netCDF, CSV, BUFR) at source-specific paths under `/nas/climate/`
 
 ### Layer B: Decode & Normalize
 
@@ -76,7 +76,7 @@ but they encode it differently (variable names, units, missing-value conventions
 formats). Layer B produces a uniform output regardless of source: same column names, same units,
 same QC state vocabulary.
 
-**Outputs:** Normalized parquets under `/nas/climate/obsmet/normalized/<source>/`
+**Outputs:** Normalized parquets under `/mnt/mco_nas1/shared/obsmet/normalized/<source>/`
 
 ### Layer C: QAQC
 
@@ -88,7 +88,7 @@ consistency over daily windows.
 values, but miss subtler problems: slow sensor drift, intermittent stuck readings, systematic
 biases. Tier 2 rules use a station's own history to detect these patterns.
 
-**Outputs:** QC-annotated parquets under `/nas/climate/obsmet/qaqc/<source>/`
+**Outputs:** QC-annotated parquets under `/mnt/mco_nas1/shared/obsmet/qaqc/<source>/`
 
 ### Layer D: Curated Products
 
@@ -101,7 +101,7 @@ irrigation scheduling) need daily values per station, not hourly multi-source pa
 Layer D also provides immutable, versioned releases so that analyses are reproducible:
 "this paper used obsmet release v2.1 from the prod channel."
 
-**Outputs:** Products under `/nas/climate/obsmet/products/`, releases under `/nas/climate/obsmet/releases/`
+**Outputs:** Products under `/mnt/mco_nas1/shared/obsmet/products/`, releases under `/mnt/mco_nas1/shared/obsmet/releases/`
 
 ### Layer E: Derived Interfaces (Future)
 
@@ -112,7 +112,7 @@ cross-source composites.
 monthly multiplicative bias between station observations and a gridded product, used as training
 targets for spatial models.
 
-**Outputs:** Artifacts under `/nas/climate/obsmet/artifacts/`
+**Outputs:** Artifacts under `/mnt/mco_nas1/shared/obsmet/artifacts/`
 
 ## Design Principles
 
@@ -126,20 +126,33 @@ targets for spatial models.
 
 ## Storage Layout
 
+Raw data lives at source-specific paths under `/nas/climate/`. Normalized outputs and
+products are written to a shared directory on the office NAS.
+
+### Raw Data (Layer A)
+
 ```
-/nas/climate/obsmet/
-├── raw/                        # Layer A output
+/nas/climate/
+├── madis/LDAD/mesonet/netCDF/   # Hourly gzip netCDF, 2001–present
+├── isd/raw/                      # Station-year .gz files from S3
+├── gdas/prepbufr/                # BUFR archives + pre-extracted parquet
+│   ├── YYYY/prepbufr.YYYYMMDD.nr.tar.gz
+│   └── parquet/YYYY/YYYYMMDD.parquet   # Pre-extracted fast path
+├── raws/wrcc/station_data/       # Per-station daily CSVs
+└── ndbc/ndbc_records/            # Per-station hourly parquets
+```
+
+### Normalized + Products (Layers B–D)
+
+```
+/mnt/mco_nas1/shared/obsmet/
+├── normalized/                 # Layer B output
 │   ├── madis/
 │   ├── isd/
-│   ├── gdas_adpsfc/
+│   ├── gdas/
 │   ├── raws_wrcc/
 │   └── ndbc/
-├── normalized/                 # Layer B output
-│   └── <source>/
-├── qaqc/                       # Layer C output
-│   └── <source>/
 ├── products/                   # Layer D output
-│   ├── hourly/
 │   ├── daily/
 │   └── station_por/
 ├── releases/                   # Versioned snapshots

@@ -68,7 +68,7 @@ uv run obsmet ingest madis --start 2018-01-01 --end 2024-12-31 --workers 4
 | `--overwrite` | off | Re-download even if file exists |
 | `--dry-run` | off | Show what would be downloaded without doing it |
 
-**Output:** Raw netCDF files at `/nas/climate/obsmet/raw/madis/YYYY/MM/DD/YYYYMMDD_HHMM.gz`
+**Output:** Raw netCDF files at `/nas/climate/madis/LDAD/mesonet/netCDF/YYYY/MM/DD/YYYYMMDD_HHMM.gz`
 
 ## Step 2: Normalize
 
@@ -121,7 +121,7 @@ uv run obsmet normalize madis --start 2018-01-01 --end 2024-12-31 \
 | `--bounds` | none | Spatial filter as `west,south,east,north` |
 | `--workers` | 4 | Parallel processing workers |
 
-**Output:** Normalized parquets at `/nas/climate/obsmet/normalized/madis/YYYY/YYYY-MM-DD.parquet`
+**Output:** Normalized parquets at `/mnt/mco_nas1/shared/obsmet/normalized/madis/YYYY/YYYY-MM-DD.parquet`
 
 ## Step 3: Build Station POR
 
@@ -163,7 +163,7 @@ flowchart LR
 uv run obsmet build station-por --source madis --start 2018-01-01 --end 2024-12-31
 ```
 
-**Output:** Per-station parquets at `/nas/climate/obsmet/products/station_por/madis/{station_key}.parquet`
+**Output:** Per-station parquets at `/mnt/mco_nas1/shared/obsmet/products/station_por/madis/{station_key}.parquet`
 
 ## Step 4: Release
 
@@ -205,7 +205,7 @@ uv run obsmet release promote --version 2.1 --channel prod
 **Output directory structure:**
 
 ```
-/nas/climate/obsmet/releases/v2.1/
+/mnt/mco_nas1/shared/obsmet/releases/v2.1/
 ├── release_metadata.json
 ├── manifest.parquet
 └── station_por/
@@ -253,7 +253,7 @@ uv run obsmet release promote --version 1.0 --channel prod
 After promotion, downstream consumers reference the release as:
 
 ```
-/nas/climate/obsmet/channels/prod/station_por/madis/{station_key}.parquet
+/mnt/mco_nas1/shared/obsmet/channels/prod/station_por/madis/{station_key}.parquet
 ```
 
 This path is stable — it always points to the current production release regardless of version

@@ -40,7 +40,7 @@ uv run obsmet ingest <source> --start DATE --end DATE [options]
 |------|------|---------|-------------|
 | `--bounds` | string | none | Spatial filter: `west,south,east,north` |
 | `--qcr-mask` | int | 115 | MADIS QCR reject bitmask |
-| `--raw-dir` | path | `/nas/climate/obsmet/raw/<source>/` | Override raw data directory |
+| `--raw-dir` | path | source-specific (see below) | Override raw data directory |
 
 **Example:**
 
@@ -192,15 +192,25 @@ Reports QC pass/fail/suspect rates by variable, station, and time period.
 
 ## Data Paths
 
-All default paths use `/nas/climate/obsmet/` as root:
+Raw data is stored at source-specific locations under `/nas/climate/`. Normalized outputs
+and products are written to `/mnt/mco_nas1/shared/obsmet/`.
+
+### Raw Data Defaults
+
+| Source | Default raw path |
+|--------|-----------------|
+| MADIS | `/nas/climate/madis/LDAD/mesonet/netCDF` |
+| ISD | `/nas/climate/isd/raw` |
+| GDAS | `/nas/climate/gdas/prepbufr` |
+| RAWS | `/nas/climate/raws/wrcc/station_data` |
+| NDBC | `/nas/climate/ndbc/ndbc_records` |
+
+### Normalized + Products
 
 | Data | Path |
 |------|------|
-| Raw files | `/nas/climate/obsmet/raw/<source>/` |
-| Normalized | `/nas/climate/obsmet/normalized/<source>/` |
-| QC output | `/nas/climate/obsmet/qaqc/<source>/` |
-| Hourly products | `/nas/climate/obsmet/products/hourly/` |
-| Daily products | `/nas/climate/obsmet/products/daily/` |
-| Station POR | `/nas/climate/obsmet/products/station_por/` |
-| Releases | `/nas/climate/obsmet/releases/v<version>/` |
-| Channels | `/nas/climate/obsmet/channels/{candidate,prod}` |
+| Normalized | `/mnt/mco_nas1/shared/obsmet/normalized/<source>/` |
+| Daily products | `/mnt/mco_nas1/shared/obsmet/products/daily/` |
+| Station POR | `/mnt/mco_nas1/shared/obsmet/products/station_por/` |
+| Releases | `/mnt/mco_nas1/shared/obsmet/releases/v<version>/` |
+| Channels | `/mnt/mco_nas1/shared/obsmet/channels/{candidate,prod}` |
