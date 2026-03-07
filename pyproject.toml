@@ -15,6 +15,7 @@ dependencies = [
     "eccodes>=2.46.0",
     "rasterio>=1.5.0",
     "agweatherqaqc @ file:///home/dgketchum/code/agweather-qaqc",
+    "requests>=2.32.5",
 ]
 
 [dependency-groups]

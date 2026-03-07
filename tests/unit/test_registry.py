@@ -13,7 +13,7 @@ from obsmet.sources.registry import (
 class TestListSources:
     def test_returns_all_five(self):
         sources = list_sources()
-        assert set(sources) == {"madis", "isd", "gdas", "raws", "ndbc"}
+        assert set(sources) == {"madis", "isd", "ghcnh", "ghcnd", "gdas", "raws", "ndbc", "snotel"}
 
     def test_sorted(self):
         sources = list_sources()

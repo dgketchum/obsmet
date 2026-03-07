@@ -67,9 +67,12 @@ QC_PROFILES: dict[str, dict] = {
 _VARIABLE_COLUMNS: dict[str, list[str]] = {
     "madis": ["tair", "td", "rh", "wind", "wind_dir", "prcp", "rsds_hourly"],
     "isd": ["tair", "td", "wind", "wind_dir", "slp", "prcp"],
+    "ghcnh": ["tair", "td", "wind", "wind_dir", "slp", "psfc", "prcp", "rh"],
+    "ghcnd": ["tmax", "tmin", "tmean", "prcp", "snow", "snow_depth", "wind", "swe"],
     "gdas": ["tair", "td", "wind", "wind_dir", "psfc"],
     "raws": ["tmean", "tmax", "tmin", "wind", "wind_dir", "rh", "prcp", "rsds"],
     "ndbc": ["tair", "td", "wind", "wind_dir", "slp"],
+    "snotel": ["tmax", "tmin", "tmean", "prcp", "swe", "rh", "wind"],
 }
 
 # Maps canonical variable names back to MADIS native names for DD/QCR column lookup

@@ -28,6 +28,14 @@ _SOURCES: dict[str, dict] = {
         "adapter": "obsmet.sources.isd.adapter.IsdAdapter",
         "parallel": True,
     },
+    "ghcnh": {
+        "adapter": "obsmet.sources.ghcnh.adapter.GhcnhAdapter",
+        "parallel": True,
+    },
+    "ghcnd": {
+        "adapter": "obsmet.sources.ghcnd.adapter.GhcndAdapter",
+        "parallel": True,
+    },
     "gdas": {
         "adapter": "obsmet.sources.gdas_prepbufr.adapter.GdasAdapter",
         "parallel": True,
@@ -38,6 +46,10 @@ _SOURCES: dict[str, dict] = {
     },
     "ndbc": {
         "adapter": "obsmet.sources.ndbc.adapter.NdbcAdapter",
+        "parallel": True,
+    },
+    "snotel": {
+        "adapter": "obsmet.sources.snotel.adapter.SnotelAdapter",
         "parallel": True,
     },
 }

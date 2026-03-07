@@ -82,6 +82,24 @@ DAILY_METRIC_FIELDS = [
     pa.field("u2", pa.float64()),
     pa.field("rsds", pa.float64()),
     pa.field("prcp", pa.float64()),
+    # Snow / cryosphere
+    pa.field("swe", pa.float64()),  # snow water equivalent (mm)
+    pa.field("snow_depth", pa.float64()),  # snow depth (mm)
+    pa.field("snow", pa.float64()),  # daily snowfall (mm)
+    # Soil (depth-indexed)
+    pa.field("soil_temp_5cm", pa.float64()),  # degC
+    pa.field("soil_temp_20cm", pa.float64()),
+    pa.field("soil_temp_50cm", pa.float64()),
+    pa.field("soil_temp_100cm", pa.float64()),
+    pa.field("soil_moisture_5cm", pa.float64()),  # m3/m3
+    pa.field("soil_moisture_20cm", pa.float64()),
+    pa.field("soil_moisture_50cm", pa.float64()),
+    pa.field("soil_moisture_100cm", pa.float64()),
+    # Marine / ocean
+    pa.field("sst", pa.float64()),  # sea surface temperature (degC)
+    pa.field("wave_height", pa.float64()),  # significant wave height (m)
+    # Radiation / sunshine
+    pa.field("sunshine_dur", pa.float64()),  # sunshine duration (hours)
 ]
 
 # --------------------------------------------------------------------------- #
@@ -112,12 +130,14 @@ QC_STATES = frozenset({"pass", "fail", "suspect", "missing"})
 SOURCES = frozenset(
     {
         "madis",
-        "isd",
+        "isd",  # deprecated — use ghcnh
+        "ghcnh",
+        "ghcnd",
         "gdas_adpsfc",
         "gdas_sfcshp",
         "raws_wrcc",
         "ndbc",
-        "ghcn",
+        "snotel",
         "synoptic",
     }
 )

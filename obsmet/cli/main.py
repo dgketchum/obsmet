@@ -32,26 +32,35 @@ def cli():
 _DEFAULT_RAW_DIRS = {
     "madis": "/nas/climate/madis/LDAD/mesonet/netCDF",
     "isd": "/nas/climate/isd/raw",
+    "ghcnh": "/nas/climate/ghcnh",
+    "ghcnd": "/nas/climate/ghcn/ghcn_daily_summaries_4FEB2022",
     "gdas": "/nas/climate/gdas/prepbufr",
     "raws": "/nas/climate/raws/wrcc/station_data",
     "ndbc": "/nas/climate/ndbc/ndbc_records",
+    "snotel": "/nas/climate/snotel/snotel_records",
 }
 
 _DEFAULT_NORM_DIRS = {
     "madis": "/mnt/mco_nas1/shared/obsmet/normalized/madis",
     "isd": "/mnt/mco_nas1/shared/obsmet/normalized/isd",
+    "ghcnh": "/mnt/mco_nas1/shared/obsmet/normalized/ghcnh",
+    "ghcnd": "/mnt/mco_nas1/shared/obsmet/normalized/ghcnd",
     "gdas": "/mnt/mco_nas1/shared/obsmet/normalized/gdas",
     "raws": "/mnt/mco_nas1/shared/obsmet/normalized/raws_wrcc",
     "ndbc": "/mnt/mco_nas1/shared/obsmet/normalized/ndbc",
+    "snotel": "/mnt/mco_nas1/shared/obsmet/normalized/snotel",
 }
 
 # Manifest source names (some differ from CLI source name)
 _MANIFEST_SOURCE = {
     "madis": "madis",
     "isd": "isd",
+    "ghcnh": "ghcnh",
+    "ghcnd": "ghcnd",
     "gdas": "gdas",
     "raws": "raws_wrcc",
     "ndbc": "ndbc",
+    "snotel": "snotel",
 }
 
 
@@ -80,6 +89,7 @@ def ingest(source, raw_dir, bounds, qcr_mask, start, end, resume, workers, overw
     _INGEST_DISPATCH = {
         "madis": _ingest_madis,
         "isd": _ingest_isd,
+        "ghcnh": _ingest_ghcnh,
         "gdas": _ingest_gdas,
         "raws": _ingest_raws,
         "ndbc": _ingest_ndbc,
@@ -487,19 +497,23 @@ def release_validate(version):
 # Earliest dates per source (start of record)
 _SOURCE_START = {
     "madis": "2001-07-01",
-    "isd": "2000-01-01",
+    "ghcnh": "1900-01-01",
+    "ghcnd": "1840-01-01",
     "gdas": "1997-01-01",
     "raws": "1990-01-01",
     "ndbc": "1970-01-01",
+    "snotel": "1980-01-01",
 }
 
 # Default workers per source
 _SOURCE_WORKERS = {
     "madis": 8,
-    "isd": 8,
+    "ghcnh": 8,
+    "ghcnd": 8,
     "gdas": 4,
     "raws": 1,
     "ndbc": 4,
+    "snotel": 4,
 }
 
 
@@ -602,7 +616,7 @@ def update(source, workers, daily, qc_profile, dry_run):
 
     if daily and not dry_run:
         click.echo("[update] running daily build...")
-        daily_sources = [s for s in sources if s in ("madis", "isd", "gdas", "ndbc")]
+        daily_sources = [s for s in sources if s in ("madis", "ghcnh", "gdas", "ndbc")]
         if daily_sources:
             from datetime import datetime as _dt
 
@@ -726,6 +740,40 @@ def _ingest_isd(start, end, raw_dir, resume, workers, dry_run, **_kw):
             state = "done" if success else "failed"
             manifest.update(key, state, run_id=run_id, message=msg)
         manifest.flush()
+
+
+def _ingest_ghcnh(start, end, raw_dir, resume, workers, dry_run, **_kw):
+    """Download GHCNh PSV station files from NCEI."""
+    from pathlib import Path
+
+    from obsmet.core.manifest import Manifest
+    from obsmet.core.provenance import generate_run_id
+    from obsmet.sources.ghcnh.download import DEFAULT_RAW_DIR, download_all
+
+    raw_dir = Path(raw_dir) if raw_dir else Path(DEFAULT_RAW_DIR)
+    manifest_path = raw_dir / "manifest.parquet"
+    manifest = Manifest(manifest_path, source="ghcnh")
+    run_id = generate_run_id()
+
+    click.echo(f"GHCNh ingest: downloading station PSV files → {raw_dir}")
+
+    if dry_run:
+        click.echo("  dry-run mode, no downloads")
+        return
+
+    done_keys = set()
+    if resume:
+        done_keys = manifest.done_keys()
+
+    results = download_all(raw_dir, workers=workers or 8, done_keys=done_keys)
+    ok = sum(1 for _, s, _ in results if s)
+    fail = sum(1 for _, s, _ in results if not s)
+
+    for fname, success, msg in results:
+        state = "done" if success else "failed"
+        manifest.update(fname, state, run_id=run_id, message=msg)
+    manifest.flush()
+    click.echo(f"GHCNh ingest done: {ok} ok, {fail} failed")
 
 
 def _ingest_gdas(start, end, raw_dir, resume, workers, dry_run, **_kw):
@@ -897,7 +945,7 @@ def _build_station_por(source, start, end, resume, workers, overwrite, dry_run):
     from obsmet.products.station_por import build_station_por
 
     if source == "all":
-        sources = ["madis", "isd", "gdas", "ndbc"]
+        sources = ["madis", "ghcnh", "ghcnd", "gdas", "ndbc", "snotel"]
     else:
         sources = [source]
 

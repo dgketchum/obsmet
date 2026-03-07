@@ -145,7 +145,7 @@ def circular_mean_deg(angles: pd.Series) -> float:
 # --------------------------------------------------------------------------- #
 
 # Sources that support hourly → daily aggregation
-DAILY_SOURCES = ["madis", "isd", "gdas", "ndbc"]
+DAILY_SOURCES = ["madis", "ghcnh", "gdas", "ndbc"]
 
 # Variables and their aggregation method for daily rollup from hourly data
 DAILY_AGG_MAP = {

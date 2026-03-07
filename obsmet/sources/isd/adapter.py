@@ -1,12 +1,14 @@
-"""ISD source adapter — maps ISD data to obsmet canonical schema.
+"""ISD source adapter — DEPRECATED, use GHCNh instead.
 
-Implements the SourceAdapter interface for NOAA Integrated Surface Database
-observations. Handles station-year file discovery and normalization from
-ISD-native units/names to the obsmet canonical hourly observation schema.
+ISD is superseded by GHCNh (Global Historical Climatology Network - Hourly),
+which subsumes all ISD stations plus additional sources with aligned GHCN IDs.
+This adapter is retained for backward compatibility with existing normalized
+data but should not be used for new normalization runs.
 """
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -14,6 +16,13 @@ import pandas as pd
 from obsmet.core.provenance import RunProvenance
 from obsmet.sources.base import SourceAdapter
 from obsmet.sources.isd.extract import apply_qc_mask, read_isd_file
+
+warnings.warn(
+    "ISD adapter is deprecated — use GHCNh (obsmet.sources.ghcnh) instead. "
+    "ISD will be removed in a future version.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 # --------------------------------------------------------------------------- #
 # ISD → canonical variable mapping

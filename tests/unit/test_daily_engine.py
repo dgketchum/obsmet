@@ -32,7 +32,7 @@ def _make_hourly(station_key, date_str, n_hours=24, **var_values):
 class TestAggregateConstants:
     def test_daily_sources_list(self):
         assert "madis" in DAILY_SOURCES
-        assert "isd" in DAILY_SOURCES
+        assert "ghcnh" in DAILY_SOURCES
         assert "gdas" in DAILY_SOURCES
         assert "ndbc" in DAILY_SOURCES
 
