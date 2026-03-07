@@ -481,6 +481,145 @@ def release_validate(version):
 
 
 # --------------------------------------------------------------------------- #
+# Update command — incremental normalize + optional daily build
+# --------------------------------------------------------------------------- #
+
+# Earliest dates per source (start of record)
+_SOURCE_START = {
+    "madis": "2001-07-01",
+    "isd": "2000-01-01",
+    "gdas": "1997-01-01",
+    "raws": "1990-01-01",
+    "ndbc": "1970-01-01",
+}
+
+# Default workers per source
+_SOURCE_WORKERS = {
+    "madis": 8,
+    "isd": 8,
+    "gdas": 4,
+    "raws": 1,
+    "ndbc": 4,
+}
+
+
+def _latest_manifest_date(manifest_path, source_name):
+    """Find the latest done key date from a manifest (for date-keyed sources)."""
+    from pathlib import Path
+
+    from obsmet.core.manifest import Manifest
+
+    msrc = _MANIFEST_SOURCE[source_name]
+    path = Path(manifest_path)
+    if not path.exists():
+        return None
+    manifest = Manifest(path, source=msrc)
+    done = manifest.done_keys()
+    if not done:
+        return None
+    # Date-keyed sources use YYYYMMDD keys
+    date_keys = sorted(k for k in done if len(k) == 8 and k.isdigit())
+    if not date_keys:
+        return None
+    from datetime import datetime
+
+    return datetime.strptime(date_keys[-1], "%Y%m%d")
+
+
+@cli.command()
+@click.option(
+    "--source",
+    default="all",
+    help="Source to update (default: all)",
+)
+@click.option("--workers", type=int, default=None, help="Override worker count")
+@click.option("--daily/--no-daily", default=True, help="Run daily build after normalize")
+@click.option(
+    "--qc-profile",
+    type=click.Choice(["strict", "permissive"]),
+    default=None,
+    help="QC profile for MADIS (default: permissive)",
+)
+@click.option("--dry-run", is_flag=True, help="Show what would be done")
+def update(source, workers, daily, qc_profile, dry_run):
+    """Incremental normalize + daily build for SOURCE (or all sources).
+
+    Reads each source's manifest to determine what's already done,
+    then processes only new keys through today. Designed for cron use.
+    """
+    from datetime import datetime
+    from pathlib import Path
+
+    sources = list(_SOURCE_START.keys()) if source == "all" else [source]
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    for src in sources:
+        if src not in _SOURCE_START:
+            click.echo(f"Unknown source {src!r}, skipping")
+            continue
+
+        src_workers = workers or _SOURCE_WORKERS[src]
+        raw_dir = _DEFAULT_RAW_DIRS[src]
+        out_dir = _DEFAULT_NORM_DIRS[src]
+        manifest_path = Path(out_dir) / "manifest.parquet"
+
+        # Determine start date: latest done key or start-of-record
+        start_str = _SOURCE_START[src]
+        if src in ("madis", "gdas"):
+            latest = _latest_manifest_date(manifest_path, src)
+            if latest:
+                start_str = latest.strftime("%Y-%m-%d")
+
+        start_dt = datetime.strptime(start_str, "%Y-%m-%d")
+        end_dt = datetime.strptime(today, "%Y-%m-%d")
+
+        # Source-specific adapter kwargs
+        adapter_kwargs = {}
+        if src == "madis":
+            profile = qc_profile or "permissive"
+            from obsmet.qaqc.engines.pipeline import QC_PROFILES
+
+            adapter_kwargs["qcr_mask"] = QC_PROFILES[profile]["qcr_mask"]
+
+        click.echo(f"[update] {src.upper()}: {start_str} → {today}, {src_workers} workers")
+
+        if dry_run:
+            click.echo(f"  dry-run: would normalize {src} {start_str} to {today}")
+            continue
+
+        _run_normalize(
+            src,
+            start_dt,
+            end_dt,
+            raw_dir,
+            out_dir,
+            resume=True,
+            workers=src_workers,
+            overwrite=False,
+            dry_run=False,
+            **adapter_kwargs,
+        )
+
+    if daily and not dry_run:
+        click.echo("[update] running daily build...")
+        daily_sources = [s for s in sources if s in ("madis", "isd", "gdas", "ndbc")]
+        if daily_sources:
+            from datetime import datetime as _dt
+
+            _build_daily(
+                source="all" if len(daily_sources) > 1 else daily_sources[0],
+                start=_dt.strptime("2000-01-01", "%Y-%m-%d"),
+                end=_dt.strptime(today, "%Y-%m-%d"),
+                resume=True,
+                workers=workers or 4,
+                overwrite=False,
+                dry_run=False,
+            )
+
+    click.echo("[update] done.")
+
+
+# --------------------------------------------------------------------------- #
 # Ingest implementations (source-specific, kept separate)
 # --------------------------------------------------------------------------- #
 
