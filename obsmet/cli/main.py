@@ -136,7 +136,7 @@ def _normalize_one(key, source_name, raw_dir, out_dir, run_id, overwrite, adapte
         build_default_pipeline,
     )
 
-    pipeline = build_default_pipeline(source_name)
+    pipeline = build_default_pipeline(source_name, **adapter_kwargs)
     var_cols = _VARIABLE_COLUMNS.get(source_name, [])
     if var_cols:
         present = [c for c in var_cols if c in df.columns]

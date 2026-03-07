@@ -87,7 +87,7 @@ _MADIS_VAR_REVERSE: dict[str, str] = {
 # --------------------------------------------------------------------------- #
 
 
-def build_default_pipeline(source: str) -> QCPipeline:
+def build_default_pipeline(source: str, **kwargs) -> QCPipeline:
     """Build a default QC pipeline for a given source."""
     from obsmet.qaqc.rules.bounds import DewpointConsistencyRule, PhysicalBoundsRule
 
@@ -97,7 +97,11 @@ def build_default_pipeline(source: str) -> QCPipeline:
         from obsmet.qaqc.rules.madis import MadisDDRule, MadisQCRRule
 
         pipeline.add_rule(MadisDDRule())
-        pipeline.add_rule(MadisQCRRule())
+        qcr_mask = kwargs.get("qcr_mask")
+        if qcr_mask is not None:
+            pipeline.add_rule(MadisQCRRule(reject_mask=qcr_mask))
+        else:
+            pipeline.add_rule(MadisQCRRule())
 
     pipeline.add_rule(PhysicalBoundsRule())
     pipeline.add_rule(DewpointConsistencyRule())
