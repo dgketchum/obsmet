@@ -141,6 +141,14 @@ class GdasAdapter(SourceAdapter):
         if parquet_path.exists():
             df = pd.read_parquet(parquet_path)
             if not df.empty:
+                # Convert nullable numeric dtypes (Int8, Float64) to numpy
+                # equivalents so downstream float() calls don't choke on pd.NA
+                import numpy as np
+
+                _NULLABLE_NUM = {"Int8", "Int16", "Int32", "Int64", "Float32", "Float64"}
+                for col in df.columns:
+                    if str(df[col].dtype) in _NULLABLE_NUM:
+                        df[col] = df[col].to_numpy(dtype="float64", na_value=np.nan)
                 if "datetime" in df.columns and "datetime_utc" not in df.columns:
                     df = df.rename(columns={"datetime": "datetime_utc"})
                 df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
