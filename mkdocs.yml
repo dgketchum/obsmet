@@ -68,8 +68,11 @@ nav:
       - Data Source: madis/index.md
       - Workflow: madis/workflow.md
       - Quality Control: madis/qaqc.md
-    - ISD: isd.md
+    - GHCNh: ghcnh.md
+    - GHCN-Daily: ghcnd.md
+    - ISD (deprecated): isd.md
     - GDAS: gdas.md
     - RAWS: raws.md
     - NDBC: ndbc.md
+    - SNOTEL: snotel.md
   - CLI Reference: cli_reference.md

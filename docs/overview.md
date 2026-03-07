@@ -71,10 +71,13 @@ picks up where it left off.
 **What it does:** Parses source-native formats, extracts meteorological variables, converts
 units to the canonical system, and applies immediate QC (source-native flags + physical bounds).
 
-**Why it exists:** A MADIS netCDF, an ISD CSV, and a GDAS BUFR file all contain air temperature,
-but they encode it differently (variable names, units, missing-value conventions, QC flag
-formats). Layer B produces a uniform output regardless of source: same column names, same units,
-same QC state vocabulary.
+**Why it exists:** A MADIS netCDF, a GHCNh PSV, a GHCN-Daily CSV, a GDAS BUFR file, and a
+SNOTEL CSV all contain air temperature, but they encode it differently (variable names, units,
+missing-value conventions, QC flag formats). Layer B produces a uniform output regardless of
+source: same column names, same units, same QC state vocabulary.
+
+**Current sources:** MADIS, GHCNh, GHCN-Daily, GDAS, RAWS, NDBC, SNOTEL. ISD is deprecated
+in favor of GHCNh.
 
 **Outputs:** Normalized parquets under `/mnt/mco_nas1/shared/obsmet/normalized/<source>/`
 
@@ -139,7 +142,10 @@ products are written to a shared directory on the office NAS.
 │   ├── YYYY/prepbufr.YYYYMMDD.nr.tar.gz
 │   └── parquet/YYYY/YYYYMMDD.parquet   # Pre-extracted fast path
 ├── raws/wrcc/station_data/       # Per-station daily CSVs
-└── ndbc/ndbc_records/            # Per-station hourly parquets
+├── ndbc/ndbc_records/            # Per-station hourly parquets
+├── ghcnh/                        # Per-station PSV files from NCEI
+├── ghcn/ghcn_daily_summaries_4FEB2022/  # Per-station daily CSVs
+└── snotel/snotel_records/        # Per-station daily CSVs (NRCS)
 ```
 
 ### Normalized + Products (Layers B–D)
@@ -151,7 +157,10 @@ products are written to a shared directory on the office NAS.
 │   ├── isd/
 │   ├── gdas/
 │   ├── raws_wrcc/
-│   └── ndbc/
+│   ├── ndbc/
+│   ├── ghcnh/
+│   ├── ghcnd/
+│   └── snotel/
 ├── products/                   # Layer D output
 │   ├── daily/
 │   └── station_por/

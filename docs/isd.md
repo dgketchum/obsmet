@@ -1,5 +1,13 @@
 # ISD Data Source
 
+!!! warning "Deprecated — Use GHCNh"
+    The ISD adapter is deprecated in favor of **GHCNh** (Global Historical Climatology
+    Network - Hourly), which subsumes all ISD stations plus additional sources with
+    aligned GHCN station IDs and improved QC metadata. See [GHCNh](ghcnh.md).
+
+    Existing ISD normalized data remains valid. New normalization runs should use GHCNh.
+    The ISD adapter will be removed in a future version.
+
 ## What ISD Is
 
 The **Integrated Surface Database (ISD)** is maintained by NOAA's National Centers for
