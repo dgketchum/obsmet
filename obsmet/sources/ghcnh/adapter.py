@@ -108,11 +108,12 @@ def normalize_station_psv(
     )
     df = df.dropna(subset=["datetime_utc"])
 
+    n = len(df)
     out = pd.DataFrame()
-    out["station_key"] = "ghcnh:" + station_id
+    out["datetime_utc"] = df["datetime_utc"].values
+    out["station_key"] = ["ghcnh:" + station_id] * n
     out["source"] = "ghcnh"
     out["source_station_id"] = station_id
-    out["datetime_utc"] = df["datetime_utc"].values
     out["lat"] = pd.to_numeric(df["Latitude"], errors="coerce").values
     out["lon"] = pd.to_numeric(df["Longitude"], errors="coerce").values
     out["elev_m"] = pd.to_numeric(df["Elevation"], errors="coerce").values

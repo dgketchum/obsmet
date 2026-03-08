@@ -71,11 +71,12 @@ def normalize_station_csv(
     except (ValueError, TypeError):
         elev = None
 
+    n = len(df)
     out = pd.DataFrame()
-    out["station_key"] = "ghcnd:" + station_id
+    out["date"] = pd.to_datetime(df["DATE"]).values
+    out["station_key"] = ["ghcnd:" + station_id] * n
     out["source"] = "ghcnd"
     out["source_station_id"] = station_id
-    out["date"] = pd.to_datetime(df["DATE"])
     out["day_basis"] = "local"
     out["lat"] = lat
     out["lon"] = lon

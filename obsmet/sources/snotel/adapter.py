@@ -54,11 +54,12 @@ def normalize_station_csv(
 
     station_id = _parse_station_id(csv_path.name)
 
+    n = len(df)
     out = pd.DataFrame()
-    out["station_key"] = f"snotel:{station_id}"
+    out["date"] = df.index
+    out["station_key"] = [f"snotel:{station_id}"] * n
     out["source"] = "snotel"
     out["source_station_id"] = station_id
-    out["date"] = df.index
     out["day_basis"] = "local"
 
     for csv_col, (canon_name, _unit) in COLUMN_MAP.items():
