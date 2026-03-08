@@ -354,13 +354,52 @@ def qaqc(source, start, end, resume, workers, overwrite, dry_run):
     default="all",
     help="Source to build from (default: all)",
 )
+@click.option(
+    "--bounds",
+    default=None,
+    help="Spatial filter: west,south,east,north (e.g. -125,24,-66,53)",
+)
+@click.option(
+    "--resolution",
+    type=click.Choice(["hourly", "daily"]),
+    default="daily",
+    help="Fabric resolution (default: daily)",
+)
+@click.option("--crosswalk-path", default=None, help="Path to crosswalk.parquet")
+@click.option("--precedence-path", default=None, help="Path to precedence TOML config")
+@click.option("--out-dir", default=None, help="Override output directory")
 @common_options
-def build(product, source, start, end, resume, workers, overwrite, dry_run):
+def build(
+    product,
+    source,
+    bounds,
+    resolution,
+    crosswalk_path,
+    precedence_path,
+    out_dir,
+    start,
+    end,
+    resume,
+    workers,
+    overwrite,
+    dry_run,
+):
     """Build curated PRODUCT (hourly, daily, station-por, or fabric)."""
     if product == "daily":
         _build_daily(source, start, end, resume, workers, overwrite, dry_run)
     elif product == "station-por":
         _build_station_por(source, start, end, resume, workers, overwrite, dry_run)
+    elif product == "fabric":
+        _build_fabric(
+            bounds=bounds,
+            resolution=resolution,
+            crosswalk_path=crosswalk_path,
+            precedence_path=precedence_path,
+            out_dir=out_dir,
+            start=start,
+            end=end,
+            dry_run=dry_run,
+        )
     else:
         click.echo(f"build {product}: start={start} end={end}")
 
@@ -370,11 +409,66 @@ def crosswalk():
     """Station identity crosswalk commands."""
 
 
-@crosswalk.command("build")
+@crosswalk.command("index")
+@click.option("--source", default="all", help="Source to index (default: all)")
+@click.option("--out-dir", default=None, help="Output directory")
+@click.option("--sample-days", type=int, default=30, help="Days to sample for per-day sources")
 @common_options
-def crosswalk_build(start, end, resume, workers, overwrite, dry_run):
-    """Build or update the station crosswalk."""
-    click.echo("crosswalk build")
+def crosswalk_index(source, out_dir, sample_days, start, end, resume, workers, overwrite, dry_run):
+    """Build station metadata index from normalized data."""
+    import logging
+    from pathlib import Path
+
+    from obsmet.crosswalk.station_index import build_station_index
+
+    logging.basicConfig(level=logging.INFO)
+
+    norm_base = Path("/mnt/mco_nas1/shared/obsmet/normalized")
+    sources = None if source == "all" else [source]
+    out = Path(out_dir) if out_dir else Path("/mnt/mco_nas1/shared/obsmet/artifacts/crosswalks")
+    out.mkdir(parents=True, exist_ok=True)
+    out_path = out / "station_index.parquet"
+
+    if dry_run:
+        click.echo(f"Would build station index → {out_path}")
+        return
+
+    df = build_station_index(norm_base, sources=sources, out_path=out_path, sample_days=sample_days)
+    click.echo(f"Station index: {len(df)} entries → {out_path}")
+
+
+@crosswalk.command("build")
+@click.option("--index-path", default=None, help="Path to station_index.parquet")
+@click.option("--out-dir", default=None, help="Output directory")
+@common_options
+def crosswalk_build(index_path, out_dir, start, end, resume, workers, overwrite, dry_run):
+    """Build station crosswalk from the station index."""
+    import logging
+    from pathlib import Path
+
+    from obsmet.crosswalk.builder import build_crosswalk
+
+    logging.basicConfig(level=logging.INFO)
+
+    artifacts = Path("/mnt/mco_nas1/shared/obsmet/artifacts/crosswalks")
+    idx = Path(index_path) if index_path else artifacts / "station_index.parquet"
+    out = Path(out_dir) if out_dir else artifacts
+    out.mkdir(parents=True, exist_ok=True)
+    out_path = out / "crosswalk.parquet"
+
+    if not idx.exists():
+        click.echo(f"Station index not found: {idx}. Run 'obsmet crosswalk index' first.")
+        return
+
+    if dry_run:
+        click.echo(f"Would build crosswalk from {idx} → {out_path}")
+        return
+
+    df = build_crosswalk(idx, out_path=out_path)
+    click.echo(
+        f"Crosswalk: {len(df)} entries, "
+        f"{df['canonical_station_id'].nunique()} canonical stations → {out_path}"
+    )
 
 
 @cli.group()
@@ -1044,6 +1138,58 @@ def _build_daily(source, start, end, resume, workers, overwrite, dry_run):
                 write_daily(daily_df, out_path)
 
     click.echo("Build daily done.")
+
+
+# --------------------------------------------------------------------------- #
+# Fabric builder
+# --------------------------------------------------------------------------- #
+
+
+def _build_fabric(
+    bounds, resolution, crosswalk_path, precedence_path, out_dir, start, end, dry_run
+):
+    """Build unified observation fabric from crosswalk + precedence."""
+    import logging
+    from pathlib import Path
+
+    from obsmet.crosswalk.precedence import load_precedence
+    from obsmet.products.fabric import build_fabric
+
+    logging.basicConfig(level=logging.INFO)
+
+    artifacts = Path("/mnt/mco_nas1/shared/obsmet/artifacts/crosswalks")
+    xwalk = Path(crosswalk_path) if crosswalk_path else artifacts / "crosswalk.parquet"
+
+    if not xwalk.exists():
+        click.echo(f"Crosswalk not found: {xwalk}. Run 'obsmet crosswalk build' first.")
+        return
+
+    precedence = load_precedence(Path(precedence_path) if precedence_path else None)
+    out = Path(out_dir) if out_dir else Path("/mnt/mco_nas1/shared/obsmet/products/fabric")
+
+    parsed_bounds = None
+    if bounds:
+        parsed_bounds = tuple(float(x) for x in bounds.split(","))
+
+    start_str = start.strftime("%Y-%m-%d") if start else None
+    end_str = end.strftime("%Y-%m-%d") if end else None
+
+    if dry_run:
+        click.echo(f"Would build {resolution} fabric → {out}")
+        if parsed_bounds:
+            click.echo(f"  bounds: {parsed_bounds}")
+        return
+
+    stats = build_fabric(
+        crosswalk_path=xwalk,
+        precedence=precedence,
+        out_dir=out,
+        bounds=parsed_bounds,
+        resolution=resolution,
+        start=start_str,
+        end=end_str,
+    )
+    click.echo(f"Fabric done: {len(stats)} stations, {sum(stats.values())} total rows → {out}")
 
 
 if __name__ == "__main__":
