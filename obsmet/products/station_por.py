@@ -154,10 +154,11 @@ def build_station_por(
     end_date=None,
     variable_columns: list[str] | None = None,
 ) -> dict[str, int]:
-    """Build station POR parquets from normalized hourly data.
+    """Build station POR parquets from normalized data.
 
-    Reads all parquets from norm_dir, aggregates to daily, applies Tier 2 QC,
-    writes one parquet per station to out_dir.
+    Streams through normalized parquets one file at a time to avoid loading
+    the entire dataset into memory. Accumulates per-station daily data,
+    applies Tier 2 QC, and writes one parquet per station.
 
     Returns dict of station_key → row_count.
     """
@@ -170,7 +171,6 @@ def build_station_por(
     if variable_columns is None:
         variable_columns = _VARIABLE_COLUMNS.get(source, [])
 
-    # Read all normalized parquets
     parquet_files = sorted(norm_dir.glob("*.parquet"))
     parquet_files = [p for p in parquet_files if p.name != "manifest.parquet"]
 
@@ -178,51 +178,86 @@ def build_station_por(
         logger.warning("No parquet files found in %s", norm_dir)
         return {}
 
-    frames = []
-    for pf in parquet_files:
-        try:
-            df = pd.read_parquet(pf)
-            frames.append(df)
-        except Exception as exc:
-            logger.warning("Failed to read %s: %s", pf, exc)
-
-    if not frames:
-        return {}
-
-    all_data = pd.concat(frames, ignore_index=True)
-
-    # Filter by date range
-    if "datetime_utc" in all_data.columns:
-        all_data["datetime_utc"] = pd.to_datetime(all_data["datetime_utc"], utc=True)
-        if start_date is not None:
-            all_data = all_data[all_data["datetime_utc"].dt.date >= start_date]
-        if end_date is not None:
-            all_data = all_data[all_data["datetime_utc"].dt.date <= end_date]
-
-    if all_data.empty or "station_key" not in all_data.columns:
-        return {}
-
-    # Aggregate to daily
-    daily = aggregate_daily_wide(all_data, provenance)
-    if daily.empty:
-        return {}
-
-    # Manifest for resume
     manifest_path = out_dir / "manifest.parquet"
     manifest = Manifest(manifest_path, source=source)
 
+    # Accumulate daily rows per station across all input files
+    station_frames: dict[str, list[pd.DataFrame]] = {}
+    n_files = len(parquet_files)
+
+    for i, pf in enumerate(parquet_files):
+        try:
+            df = pd.read_parquet(pf)
+        except Exception as exc:
+            logger.warning("Failed to read %s: %s", pf, exc)
+            continue
+
+        if df.empty:
+            continue
+
+        # Filter by date range
+        if "datetime_utc" in df.columns:
+            df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+            if start_date is not None:
+                df = df[df["datetime_utc"].dt.date >= start_date]
+            if end_date is not None:
+                df = df[df["datetime_utc"].dt.date <= end_date]
+            if df.empty:
+                continue
+
+        if "station_key" not in df.columns:
+            continue
+
+        # Aggregate this file's data to daily
+        daily = aggregate_daily_wide(df, provenance)
+        if daily.empty:
+            continue
+
+        # Distribute daily rows to per-station accumulators
+        for sk, grp in daily.groupby("station_key"):
+            sk = str(sk)
+            if sk not in station_frames:
+                station_frames[sk] = []
+            station_frames[sk].append(grp)
+
+        if (i + 1) % 200 == 0:
+            logger.info(
+                "  read %d/%d files, %d stations accumulated", i + 1, n_files, len(station_frames)
+            )
+
+    # Final flush — all stations accumulated, write once per station
+    logger.info("Flushing %d remaining stations ...", len(station_frames))
+    stats = _flush_stations(station_frames, out_dir, manifest, provenance, variable_columns)
+    manifest.flush()
+    return stats
+
+
+def _flush_stations(
+    station_frames: dict[str, list[pd.DataFrame]],
+    out_dir: Path,
+    manifest: Manifest,
+    provenance: RunProvenance,
+    variable_columns: list[str],
+) -> dict[str, int]:
+    """Concatenate, QC, and write accumulated station data. Clears the dict."""
     stats: dict[str, int] = {}
-    for station_key, grp in daily.groupby("station_key"):
-        station_key = str(station_key)
+
+    for station_key in list(station_frames.keys()):
+        frames = station_frames.pop(station_key)
+        grp = pd.concat(frames, ignore_index=True)
         grp = grp.sort_values("date").reset_index(drop=True)
+
+        # Deduplicate in case of overlapping files
+        if "date" in grp.columns:
+            grp = grp.drop_duplicates(subset=["date"], keep="first")
 
         # Apply Tier 2 QC
         grp = _apply_tier2_qc(grp, variable_columns)
 
-        out_path = out_dir / f"{station_key}.parquet"
+        safe_name = station_key.replace(":", "_").replace("/", "_")
+        out_path = out_dir / f"{safe_name}.parquet"
         grp.to_parquet(out_path, index=False, compression="snappy")
         manifest.update(station_key, "done", run_id=provenance.run_id)
         stats[station_key] = len(grp)
 
-    manifest.flush()
     return stats
