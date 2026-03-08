@@ -61,7 +61,15 @@ def normalize_station_csv(
     station_id = df["STATION"].iloc[0].strip('"')
     lat = float(df["LATITUDE"].iloc[0])
     lon = float(df["LONGITUDE"].iloc[0])
-    elev = float(df["ELEVATION"].iloc[0]) if df["ELEVATION"].iloc[0].strip('"') else None
+    elev_raw = df["ELEVATION"].iloc[0]
+    try:
+        elev = (
+            float(str(elev_raw).strip('"'))
+            if pd.notna(elev_raw) and str(elev_raw).strip('"')
+            else None
+        )
+    except (ValueError, TypeError):
+        elev = None
 
     out = pd.DataFrame()
     out["station_key"] = "ghcnd:" + station_id
