@@ -144,6 +144,14 @@ def _apply_tier2_qc(
     return station_df
 
 
+_N_BUCKETS = 100
+
+
+def _bucket_id(station_key: str, n_buckets: int = _N_BUCKETS) -> int:
+    """Deterministic hash bucket for a station key."""
+    return hash(station_key) % n_buckets
+
+
 def build_station_por(
     source: str,
     norm_dir: Path | str,
@@ -153,15 +161,23 @@ def build_station_por(
     start_date=None,
     end_date=None,
     variable_columns: list[str] | None = None,
+    n_buckets: int = _N_BUCKETS,
 ) -> dict[str, int]:
     """Build station POR parquets from normalized data.
 
-    Streams through normalized parquets one file at a time to avoid loading
-    the entire dataset into memory. Accumulates per-station daily data,
-    applies Tier 2 QC, and writes one parquet per station.
+    Two-pass bucketed approach to bound memory usage:
+      Pass 1: Read each day file, aggregate to daily, spill rows into
+              N temp bucket parquets (hash on station_key).
+      Pass 2: Read each bucket, groupby station, apply Tier 2 QC,
+              write final per-station parquets.
+
+    Peak memory ~ max(one day file, one bucket ≈ total_daily / N).
 
     Returns dict of station_key → row_count.
     """
+    import shutil
+    import tempfile
+
     from obsmet.qaqc.engines.pipeline import _VARIABLE_COLUMNS
 
     norm_dir = Path(norm_dir)
@@ -178,11 +194,16 @@ def build_station_por(
         logger.warning("No parquet files found in %s", norm_dir)
         return {}
 
-    manifest_path = out_dir / "manifest.parquet"
-    manifest = Manifest(manifest_path, source=source)
+    # ------------------------------------------------------------------ #
+    # Pass 1: read day files → aggregate to daily → spill to buckets
+    # ------------------------------------------------------------------ #
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"station_por_{source}_"))
+    logger.info("Pass 1: spilling daily rows to %d buckets in %s", n_buckets, tmp_dir)
 
-    # Accumulate daily rows per station across all input files
-    station_frames: dict[str, list[pd.DataFrame]] = {}
+    # Accumulate rows per bucket in memory, flush each bucket periodically
+    bucket_frames: dict[int, list[pd.DataFrame]] = {i: [] for i in range(n_buckets)}
+    bucket_row_counts: dict[int, int] = {i: 0 for i in range(n_buckets)}
+    _BUCKET_FLUSH_ROWS = 50_000  # flush a bucket to disk when it exceeds this many rows
     n_files = len(parquet_files)
 
     for i, pf in enumerate(parquet_files):
@@ -208,56 +229,102 @@ def build_station_por(
         if "station_key" not in df.columns:
             continue
 
-        # Aggregate this file's data to daily
+        # Aggregate this file's hourly data to daily
         daily = aggregate_daily_wide(df, provenance)
         if daily.empty:
             continue
 
-        # Distribute daily rows to per-station accumulators
-        for sk, grp in daily.groupby("station_key"):
-            sk = str(sk)
-            if sk not in station_frames:
-                station_frames[sk] = []
-            station_frames[sk].append(grp)
+        # Distribute daily rows to hash buckets
+        daily["_bucket"] = daily["station_key"].apply(_bucket_id, n_buckets=n_buckets)
+        for bid, grp in daily.groupby("_bucket"):
+            grp = grp.drop(columns=["_bucket"])
+            bucket_frames[bid].append(grp)
+            bucket_row_counts[bid] += len(grp)
+
+            # Flush bucket to disk if it's grown large
+            if bucket_row_counts[bid] >= _BUCKET_FLUSH_ROWS:
+                _spill_bucket(bid, bucket_frames[bid], tmp_dir)
+                bucket_frames[bid] = []
+                bucket_row_counts[bid] = 0
 
         if (i + 1) % 200 == 0:
-            logger.info(
-                "  read %d/%d files, %d stations accumulated", i + 1, n_files, len(station_frames)
-            )
+            logger.info("  pass 1: %d/%d files", i + 1, n_files)
 
-    # Final flush — all stations accumulated, write once per station
-    logger.info("Flushing %d remaining stations ...", len(station_frames))
-    stats = _flush_stations(station_frames, out_dir, manifest, provenance, variable_columns)
-    manifest.flush()
-    return stats
+    # Final spill of remaining in-memory bucket data
+    for bid in range(n_buckets):
+        if bucket_frames[bid]:
+            _spill_bucket(bid, bucket_frames[bid], tmp_dir)
+    del bucket_frames, bucket_row_counts
 
+    logger.info("Pass 1 complete: %d files processed", n_files)
 
-def _flush_stations(
-    station_frames: dict[str, list[pd.DataFrame]],
-    out_dir: Path,
-    manifest: Manifest,
-    provenance: RunProvenance,
-    variable_columns: list[str],
-) -> dict[str, int]:
-    """Concatenate, QC, and write accumulated station data. Clears the dict."""
+    # ------------------------------------------------------------------ #
+    # Pass 2: read each bucket → groupby station → QC → write final
+    # ------------------------------------------------------------------ #
+    logger.info("Pass 2: reading buckets, applying QC, writing per-station parquets")
+
+    manifest_path = out_dir / "manifest.parquet"
+    manifest = Manifest(manifest_path, source=source)
     stats: dict[str, int] = {}
 
-    for station_key in list(station_frames.keys()):
-        frames = station_frames.pop(station_key)
-        grp = pd.concat(frames, ignore_index=True)
-        grp = grp.sort_values("date").reset_index(drop=True)
+    for bid in range(n_buckets):
+        bucket_files = sorted(tmp_dir.glob(f"bucket_{bid:04d}_*.parquet"))
+        if not bucket_files:
+            continue
 
-        # Deduplicate in case of overlapping files
-        if "date" in grp.columns:
-            grp = grp.drop_duplicates(subset=["date"], keep="first")
+        frames = []
+        for bf in bucket_files:
+            try:
+                frames.append(pd.read_parquet(bf))
+            except Exception as exc:
+                logger.warning("Failed to read bucket file %s: %s", bf, exc)
 
-        # Apply Tier 2 QC
-        grp = _apply_tier2_qc(grp, variable_columns)
+        if not frames:
+            continue
 
-        safe_name = station_key.replace(":", "_").replace("/", "_")
-        out_path = out_dir / f"{safe_name}.parquet"
-        grp.to_parquet(out_path, index=False, compression="snappy")
-        manifest.update(station_key, "done", run_id=provenance.run_id)
-        stats[station_key] = len(grp)
+        bucket_df = pd.concat(frames, ignore_index=True)
+        del frames
+
+        for station_key, grp in bucket_df.groupby("station_key"):
+            station_key = str(station_key)
+            grp = grp.sort_values("date").reset_index(drop=True)
+
+            # Deduplicate in case of overlapping day files
+            if "date" in grp.columns:
+                grp = grp.drop_duplicates(subset=["date"], keep="first")
+
+            # Apply Tier 2 QC
+            grp = _apply_tier2_qc(grp, variable_columns)
+
+            safe_name = station_key.replace(":", "_").replace("/", "_")
+            out_path = out_dir / f"{safe_name}.parquet"
+            grp.to_parquet(out_path, index=False, compression="snappy")
+            manifest.update(station_key, "done", run_id=provenance.run_id)
+            stats[station_key] = len(grp)
+
+        del bucket_df
+
+        if (bid + 1) % 10 == 0:
+            logger.info(
+                "  pass 2: %d/%d buckets, %d stations written", bid + 1, n_buckets, len(stats)
+            )
+
+    manifest.flush()
+
+    # Clean up temp dir
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    logger.info("Station POR complete: %d stations", len(stats))
 
     return stats
+
+
+def _spill_bucket(bucket_id: int, frames: list[pd.DataFrame], tmp_dir: Path) -> None:
+    """Write accumulated frames for one bucket to a temp parquet file."""
+    if not frames:
+        return
+    df = pd.concat(frames, ignore_index=True)
+    # Use a sequence number to allow multiple spills per bucket
+    existing = list(tmp_dir.glob(f"bucket_{bucket_id:04d}_*.parquet"))
+    seq = len(existing)
+    out = tmp_dir / f"bucket_{bucket_id:04d}_{seq:04d}.parquet"
+    df.to_parquet(out, index=False, compression="snappy")

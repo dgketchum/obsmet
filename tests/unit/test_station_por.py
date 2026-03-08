@@ -51,8 +51,8 @@ class TestBuildStationPor:
             stats = build_station_por("madis", norm_dir, out_dir, provenance)
 
             assert len(stats) == 2
-            assert (out_dir / "madis:STN_A.parquet").exists()
-            assert (out_dir / "madis:STN_B.parquet").exists()
+            assert (out_dir / "madis_STN_A.parquet").exists()
+            assert (out_dir / "madis_STN_B.parquet").exists()
 
     def test_output_has_qc_columns(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -66,7 +66,7 @@ class TestBuildStationPor:
             provenance = RunProvenance(source="madis", command="test")
             build_station_por("madis", norm_dir, out_dir, provenance)
 
-            result = pd.read_parquet(out_dir / "madis:STN_A.parquet")
+            result = pd.read_parquet(out_dir / "madis_STN_A.parquet")
             assert "qc_state" in result.columns
             assert "qc_reason_codes" in result.columns
 
@@ -85,7 +85,7 @@ class TestBuildStationPor:
             provenance = RunProvenance(source="madis", command="test")
             build_station_por("madis", norm_dir, out_dir, provenance)
 
-            result = pd.read_parquet(out_dir / "madis:STN_A.parquet")
+            result = pd.read_parquet(out_dir / "madis_STN_A.parquet")
             # The extreme day should have a non-empty reason code
             first_day = result.iloc[0]
             assert (
