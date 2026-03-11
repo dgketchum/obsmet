@@ -248,6 +248,13 @@ def aggregate_daily_wide(
             if not rsds_vals.empty:
                 rec["rsds"] = float(rsds_vals.mean()) * 86400.0 / 1e6
 
+        # Carry station metadata (first non-null value in group)
+        for meta_col in ("lat", "lon", "elev_m"):
+            if meta_col in grp.columns:
+                vals = grp[meta_col].dropna()
+                if not vals.empty:
+                    rec[meta_col] = float(vals.iloc[0])
+
         daily_records.append(rec)
 
     if not daily_records:

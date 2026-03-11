@@ -358,6 +358,29 @@ class TestRsPeriodRatio:
         assert len(corr_rs) == n
 
 
+class TestRsoASCE:
+    def test_shape_and_range(self):
+        """compute_rso_asce returns 365 values, all positive, with seasonal cycle."""
+        from obsmet.products.rsun import compute_rso_asce
+
+        rso = compute_rso_asce(lat_deg=45.0, elev_m=500.0)
+        assert rso.shape == (365,)
+        assert np.all(rso >= 0)
+        # Summer (DOY ~172) should be higher than winter (DOY ~355)
+        assert rso[171] > rso[354]
+        # Reasonable range for MJ/m²/day at 45°N
+        assert rso.max() < 45.0
+        assert rso.max() > 20.0
+
+    def test_elevation_increases_rso(self):
+        """Higher elevation should give slightly higher Rso."""
+        from obsmet.products.rsun import compute_rso_asce
+
+        low = compute_rso_asce(lat_deg=45.0, elev_m=0.0)
+        high = compute_rso_asce(lat_deg=45.0, elev_m=3000.0)
+        assert np.all(high >= low)
+
+
 class TestCompiledHumidity:
     def test_td_present(self):
         """When td is present, ea_compiled should be derived from it."""

@@ -207,6 +207,44 @@ class TestTier2QCImprovements:
         assert "rhmax_corrected" in result.columns
         assert "rhmin_corrected" in result.columns
 
+    def test_rso_asce_fallback_produces_rsds_corrected(self):
+        """When lat/elev_m are in hourly data, ASCE Rso enables Rs correction."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            norm_dir = Path(tmpdir) / "normalized"
+            norm_dir.mkdir()
+            out_dir = Path(tmpdir) / "station_por"
+
+            rng = np.random.default_rng(42)
+            n = 365 * 24  # 1 year hourly
+            dt = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+            # Seasonal Rs pattern with noise
+            doy = dt.dayofyear
+            rs_base = np.sin(doy / 365 * np.pi) * 400 + 100
+            df = pd.DataFrame(
+                {
+                    "station_key": "madis:RSO_TEST",
+                    "datetime_utc": dt,
+                    "tair": rng.normal(10, 5, n),
+                    "rsds_hourly": rs_base + rng.normal(0, 20, n),
+                    "lat": 45.0,
+                    "lon": -117.0,
+                    "elev_m": 800.0,
+                    "qc_state": "pass",
+                    "qc_reason_codes": "",
+                    "ingest_run_id": "test",
+                    "transform_version": "0.1.0",
+                }
+            )
+            df.to_parquet(norm_dir / "day1.parquet", index=False)
+
+            provenance = RunProvenance(source="madis", command="test")
+            build_station_por("madis", norm_dir, out_dir, provenance)
+
+            result = pd.read_parquet(out_dir / "madis_RSO_TEST.parquet")
+            assert "rsds_corrected" in result.columns
+            assert "lat" in result.columns
+            assert "elev_m" in result.columns
+
     def test_min_por_filter(self):
         """Station with insufficient coverage should be skipped."""
         with tempfile.TemporaryDirectory() as tmpdir:

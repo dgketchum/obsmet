@@ -497,9 +497,10 @@ class RsPeriodRatioRule(QCRule):
         Parameters
         ----------
         rs : pd.Series
-            Daily observed solar radiation in W/m² (aligned index).
+            Daily observed solar radiation (aligned index). Must be same
+            units as rso (typically MJ/m²/day).
         rso : np.ndarray
-            365-element clear-sky array from RSUN (W/m²), indexed by DOY-1.
+            365-element clear-sky array indexed by DOY-1 (same units as rs).
         doy : pd.Series
             Day-of-year for each observation (1-365, aligned index).
         """

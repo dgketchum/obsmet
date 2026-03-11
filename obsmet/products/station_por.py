@@ -57,7 +57,8 @@ def _apply_tier2_qc(
     Parameters
     ----------
     rso : np.ndarray, optional
-        365-element RSUN clear-sky array (W/m²) for Rs period-ratio correction.
+        365-element clear-sky array (MJ/m²/day, same units as rsds) for
+        Rs period-ratio correction.  From RSUN raster or ASCE flat-earth.
     """
     zscore_rule = MonthlyZScoreRule()
     stuck_rule = StuckSensorRule(min_run_length=5)  # daily threshold
@@ -308,9 +309,11 @@ def build_station_por(
     # ------------------------------------------------------------------ #
     logger.info("Pass 2: reading buckets, applying QC, writing per-station parquets")
 
-    # Load station coordinates for Rso extraction (optional)
+    # Rso source: RSUN raster (terrain-corrected, limited extent) or
+    # flat-earth ASCE via refet (needs lat + elev_m from daily data).
+    use_rsun_raster = rsun_path is not None and station_index_path is not None
     station_coords: dict[str, tuple[float, float]] = {}
-    if station_index_path is not None and rsun_path is not None:
+    if use_rsun_raster:
         idx_path = Path(station_index_path)
         if idx_path.exists():
             idx_df = pd.read_parquet(idx_path)
@@ -318,7 +321,9 @@ def build_station_por(
                 key = row.get("canonical_id") or row.get("station_key")
                 if key and pd.notna(row.get("lat")) and pd.notna(row.get("lon")):
                     station_coords[str(key)] = (float(row["lon"]), float(row["lat"]))
-            logger.info("Loaded %d station coords for Rso lookup", len(station_coords))
+            logger.info("Loaded %d station coords for RSUN Rso lookup", len(station_coords))
+        else:
+            use_rsun_raster = False
 
     manifest_path = out_dir / "manifest.parquet"
     manifest = Manifest(manifest_path, source=source)
@@ -359,9 +364,9 @@ def build_station_por(
                 if sufficient_days < min_por_days:
                     continue
 
-            # Look up Rso for this station (optional)
+            # Compute Rso for Rs QC
             rso = None
-            if station_key in station_coords and rsun_path is not None:
+            if use_rsun_raster and station_key in station_coords:
                 lon, lat = station_coords[station_key]
                 try:
                     from obsmet.products.rsun import extract_station_rsun
@@ -369,6 +374,17 @@ def build_station_por(
                     rso = extract_station_rsun(lon, lat, str(rsun_path))
                 except Exception:
                     pass
+
+            if rso is None and "lat" in grp.columns and "elev_m" in grp.columns:
+                lat_val = pd.to_numeric(grp["lat"], errors="coerce").dropna()
+                elev_val = pd.to_numeric(grp["elev_m"], errors="coerce").dropna()
+                if not lat_val.empty and not elev_val.empty:
+                    try:
+                        from obsmet.products.rsun import compute_rso_asce
+
+                        rso = compute_rso_asce(float(lat_val.iloc[0]), float(elev_val.iloc[0]))
+                    except Exception:
+                        pass
 
             # Apply Tier 2 QC
             grp = _apply_tier2_qc(grp, variable_columns, rso=rso)
