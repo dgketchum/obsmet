@@ -1099,6 +1099,7 @@ def _build_station_por(
             station_index_path=station_index_path,
             rsun_path=rsun_path,
             min_por_days=min_por_days,
+            workers=workers,
         )
         click.echo(f"  {src}: {len(stats)} stations written")
 

@@ -6,6 +6,7 @@ and writes one parquet per station.
 
 from __future__ import annotations
 
+import io
 import logging
 from pathlib import Path
 
@@ -195,6 +196,109 @@ def _bucket_id(station_key: str, n_buckets: int = _N_BUCKETS) -> int:
     return hash(station_key) % n_buckets
 
 
+# ------------------------------------------------------------------ #
+# Pass 1 worker: read one day file, aggregate to daily
+# ------------------------------------------------------------------ #
+
+
+def _aggregate_one_file(args: tuple) -> pd.DataFrame | None:
+    """Worker: read a normalized parquet, aggregate to daily, return DataFrame."""
+    pf_str, prov_dict, start_date, end_date = args
+    pf = Path(pf_str)
+
+    # Reconstruct provenance (can't pickle RunProvenance across processes easily)
+    prov = RunProvenance(**prov_dict)
+
+    try:
+        df = pd.read_parquet(pf)
+    except Exception:
+        return None
+
+    if df.empty or "station_key" not in df.columns:
+        return None
+
+    if "datetime_utc" in df.columns:
+        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+        if start_date is not None:
+            df = df[df["datetime_utc"].dt.date >= start_date]
+        if end_date is not None:
+            df = df[df["datetime_utc"].dt.date <= end_date]
+        if df.empty:
+            return None
+
+    daily = aggregate_daily_wide(df, prov)
+    return daily if not daily.empty else None
+
+
+# ------------------------------------------------------------------ #
+# Pass 2 worker: process a list of stations from one bucket
+# ------------------------------------------------------------------ #
+
+
+def _process_bucket(args: tuple) -> dict[str, int]:
+    """Worker: process all stations in a bucket — QC + write parquets."""
+    (
+        bucket_df_bytes,
+        variable_columns,
+        out_dir_str,
+        source,
+        run_id,
+        use_rsun_raster,
+        station_coords,
+        rsun_path,
+        min_por_days,
+    ) = args
+
+    out_dir = Path(out_dir_str)
+    bucket_df = pd.read_parquet(io.BytesIO(bucket_df_bytes))
+    stats: dict[str, int] = {}
+
+    for station_key, grp in bucket_df.groupby("station_key"):
+        station_key = str(station_key)
+        grp = grp.sort_values("date").reset_index(drop=True)
+
+        if "date" in grp.columns:
+            grp = grp.drop_duplicates(subset=["date"], keep="first")
+
+        # Minimum POR filter
+        if min_por_days > 0:
+            obs_count = pd.to_numeric(grp.get("obs_count", pd.Series(dtype=float)), errors="coerce")
+            sufficient_days = int((obs_count >= 18).sum())
+            if sufficient_days < min_por_days:
+                continue
+
+        # Compute Rso for Rs QC
+        rso = None
+        if use_rsun_raster and station_key in station_coords:
+            lon, lat = station_coords[station_key]
+            try:
+                from obsmet.products.rsun import extract_station_rsun
+
+                rso = extract_station_rsun(lon, lat, str(rsun_path))
+            except Exception:
+                pass
+
+        if rso is None and "lat" in grp.columns and "elev_m" in grp.columns:
+            lat_val = pd.to_numeric(grp["lat"], errors="coerce").dropna()
+            elev_val = pd.to_numeric(grp["elev_m"], errors="coerce").dropna()
+            if not lat_val.empty and not elev_val.empty:
+                try:
+                    from obsmet.products.rsun import compute_rso_asce
+
+                    rso = compute_rso_asce(float(lat_val.iloc[0]), float(elev_val.iloc[0]))
+                except Exception:
+                    pass
+
+        grp = _apply_tier2_qc(grp, variable_columns, rso=rso)
+
+        safe_name = station_key.replace(":", "_").replace("/", "_")
+        out_path = out_dir / f"{safe_name}.parquet"
+        grp.to_parquet(out_path, index=False, compression="snappy")
+        stats[station_key] = len(grp)
+
+    return stats
+
+
 def build_station_por(
     source: str,
     norm_dir: Path | str,
@@ -208,21 +312,20 @@ def build_station_por(
     station_index_path: Path | str | None = None,
     rsun_path: Path | str | None = None,
     min_por_days: int = 0,
+    workers: int = 1,
 ) -> dict[str, int]:
     """Build station POR parquets from normalized data.
 
-    Two-pass bucketed approach to bound memory usage:
-      Pass 1: Read each day file, aggregate to daily, spill rows into
-              N temp bucket parquets (hash on station_key).
-      Pass 2: Read each bucket, groupby station, apply Tier 2 QC,
-              write final per-station parquets.
+    Two-pass approach:
+      Pass 1: Read day files (parallel), aggregate to daily, collect in memory.
+      Pass 2: Hash-bucket by station, process buckets in parallel (QC + write).
 
-    Peak memory ~ max(one day file, one bucket ≈ total_daily / N).
+    With workers=1, runs single-threaded (original behavior).
+    With workers>1, uses ProcessPoolExecutor for both passes.
 
     Returns dict of station_key → row_count.
     """
-    import shutil
-    import tempfile
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     from obsmet.qaqc.engines.pipeline import _VARIABLE_COLUMNS
 
@@ -240,77 +343,71 @@ def build_station_por(
         logger.warning("No parquet files found in %s", norm_dir)
         return {}
 
-    # ------------------------------------------------------------------ #
-    # Pass 1: read day files → aggregate to daily → spill to buckets
-    # ------------------------------------------------------------------ #
-    tmp_dir = Path(tempfile.mkdtemp(prefix=f"station_por_{source}_"))
-    logger.info("Pass 1: spilling daily rows to %d buckets in %s", n_buckets, tmp_dir)
-
-    # Accumulate rows per bucket in memory, flush each bucket periodically
-    bucket_frames: dict[int, list[pd.DataFrame]] = {i: [] for i in range(n_buckets)}
-    bucket_row_counts: dict[int, int] = {i: 0 for i in range(n_buckets)}
-    _BUCKET_FLUSH_ROWS = 50_000  # flush a bucket to disk when it exceeds this many rows
     n_files = len(parquet_files)
+    use_parallel = workers > 1
 
-    for i, pf in enumerate(parquet_files):
-        try:
-            df = pd.read_parquet(pf)
-        except Exception as exc:
-            logger.warning("Failed to read %s: %s", pf, exc)
-            continue
-
-        if df.empty:
-            continue
-
-        # Filter by date range
-        if "datetime_utc" in df.columns:
-            df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
-            if start_date is not None:
-                df = df[df["datetime_utc"].dt.date >= start_date]
-            if end_date is not None:
-                df = df[df["datetime_utc"].dt.date <= end_date]
-            if df.empty:
-                continue
-
-        if "station_key" not in df.columns:
-            continue
-
-        # Aggregate this file's hourly data to daily
-        daily = aggregate_daily_wide(df, provenance)
-        if daily.empty:
-            continue
-
-        # Distribute daily rows to hash buckets
-        daily["_bucket"] = daily["station_key"].apply(_bucket_id, n_buckets=n_buckets)
-        for bid, grp in daily.groupby("_bucket"):
-            grp = grp.drop(columns=["_bucket"])
-            bucket_frames[bid].append(grp)
-            bucket_row_counts[bid] += len(grp)
-
-            # Flush bucket to disk if it's grown large
-            if bucket_row_counts[bid] >= _BUCKET_FLUSH_ROWS:
-                _spill_bucket(bid, bucket_frames[bid], tmp_dir)
-                bucket_frames[bid] = []
-                bucket_row_counts[bid] = 0
-
-        if (i + 1) % 200 == 0:
-            logger.info("  pass 1: %d/%d files", i + 1, n_files)
-
-    # Final spill of remaining in-memory bucket data
-    for bid in range(n_buckets):
-        if bucket_frames[bid]:
-            _spill_bucket(bid, bucket_frames[bid], tmp_dir)
-    del bucket_frames, bucket_row_counts
-
-    logger.info("Pass 1 complete: %d files processed", n_files)
+    # Serialize provenance for worker pickling
+    prov_dict = {
+        "run_id": provenance.run_id,
+        "schema_version": provenance.schema_version,
+        "qaqc_rules_version": provenance.qaqc_rules_version,
+        "crosswalk_version": provenance.crosswalk_version,
+        "transform_version": provenance.transform_version,
+        "source": provenance.source,
+        "command": provenance.command,
+    }
 
     # ------------------------------------------------------------------ #
-    # Pass 2: read each bucket → groupby station → QC → write final
+    # Pass 1: read day files → aggregate to daily → collect in memory
     # ------------------------------------------------------------------ #
-    logger.info("Pass 2: reading buckets, applying QC, writing per-station parquets")
+    logger.info(
+        "Pass 1: reading %d files, aggregating to daily (%d workers)",
+        n_files,
+        workers,
+    )
 
-    # Rso source: RSUN raster (terrain-corrected, limited extent) or
-    # flat-earth ASCE via refet (needs lat + elev_m from daily data).
+    all_daily: list[pd.DataFrame] = []
+
+    if use_parallel:
+        task_args = [(str(pf), prov_dict, start_date, end_date) for pf in parquet_files]
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_aggregate_one_file, a): i for i, a in enumerate(task_args)}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                result = future.result()
+                if result is not None:
+                    all_daily.append(result)
+                if done_count % 500 == 0:
+                    logger.info("  pass 1: %d/%d files done", done_count, n_files)
+    else:
+        for i, pf in enumerate(parquet_files):
+            result = _aggregate_one_file((str(pf), prov_dict, start_date, end_date))
+            if result is not None:
+                all_daily.append(result)
+            if (i + 1) % 200 == 0:
+                logger.info("  pass 1: %d/%d files", i + 1, n_files)
+
+    if not all_daily:
+        logger.warning("No daily data produced from %d files", n_files)
+        return {}
+
+    logger.info("Pass 1 complete: %d files → %d daily chunks", n_files, len(all_daily))
+
+    # Concat all daily data in memory
+    daily_all = pd.concat(all_daily, ignore_index=True)
+    del all_daily
+    logger.info("Total daily rows: %d", len(daily_all))
+
+    # ------------------------------------------------------------------ #
+    # Pass 2: hash-bucket → parallel QC + write
+    # ------------------------------------------------------------------ #
+    logger.info("Pass 2: bucketing %d stations, applying QC (%d workers)", n_buckets, workers)
+
+    # Assign buckets
+    daily_all["_bucket"] = daily_all["station_key"].apply(_bucket_id, n_buckets=n_buckets)
+
+    # Rso source setup
     use_rsun_raster = rsun_path is not None and station_index_path is not None
     station_coords: dict[str, tuple[float, float]] = {}
     if use_rsun_raster:
@@ -325,99 +422,122 @@ def build_station_por(
         else:
             use_rsun_raster = False
 
-    manifest_path = out_dir / "manifest.parquet"
-    manifest = Manifest(manifest_path, source=source)
     stats: dict[str, int] = {}
 
-    for bid in range(n_buckets):
-        bucket_files = sorted(tmp_dir.glob(f"bucket_{bid:04d}_*.parquet"))
-        if not bucket_files:
-            continue
-
-        frames = []
-        for bf in bucket_files:
-            try:
-                frames.append(pd.read_parquet(bf))
-            except Exception as exc:
-                logger.warning("Failed to read bucket file %s: %s", bf, exc)
-
-        if not frames:
-            continue
-
-        bucket_df = pd.concat(frames, ignore_index=True)
-        del frames
-
-        for station_key, grp in bucket_df.groupby("station_key"):
-            station_key = str(station_key)
-            grp = grp.sort_values("date").reset_index(drop=True)
-
-            # Deduplicate in case of overlapping day files
-            if "date" in grp.columns:
-                grp = grp.drop_duplicates(subset=["date"], keep="first")
-
-            # Minimum POR filter
-            if min_por_days > 0:
-                obs_count = pd.to_numeric(
-                    grp.get("obs_count", pd.Series(dtype=float)), errors="coerce"
+    if use_parallel:
+        # Serialize each bucket to bytes for worker transfer
+        bucket_tasks = []
+        for bid in range(n_buckets):
+            bucket_df = daily_all[daily_all["_bucket"] == bid].drop(columns=["_bucket"])
+            if bucket_df.empty:
+                continue
+            buf = io.BytesIO()
+            bucket_df.to_parquet(buf, index=False)
+            bucket_tasks.append(
+                (
+                    buf.getvalue(),
+                    variable_columns,
+                    str(out_dir),
+                    source,
+                    provenance.run_id,
+                    use_rsun_raster,
+                    station_coords,
+                    str(rsun_path) if rsun_path else None,
+                    min_por_days,
                 )
-                sufficient_days = int((obs_count >= 18).sum())
-                if sufficient_days < min_por_days:
-                    continue
+            )
 
-            # Compute Rso for Rs QC
-            rso = None
-            if use_rsun_raster and station_key in station_coords:
-                lon, lat = station_coords[station_key]
-                try:
-                    from obsmet.products.rsun import extract_station_rsun
+        del daily_all
+        logger.info("Serialized %d non-empty buckets, submitting to pool", len(bucket_tasks))
 
-                    rso = extract_station_rsun(lon, lat, str(rsun_path))
-                except Exception:
-                    pass
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_process_bucket, t): i for i, t in enumerate(bucket_tasks)}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                bucket_stats = future.result()
+                stats.update(bucket_stats)
+                if done_count % 10 == 0:
+                    logger.info(
+                        "  pass 2: %d/%d buckets done, %d stations",
+                        done_count,
+                        len(bucket_tasks),
+                        len(stats),
+                    )
 
-            if rso is None and "lat" in grp.columns and "elev_m" in grp.columns:
-                lat_val = pd.to_numeric(grp["lat"], errors="coerce").dropna()
-                elev_val = pd.to_numeric(grp["elev_m"], errors="coerce").dropna()
-                if not lat_val.empty and not elev_val.empty:
+        del bucket_tasks
+    else:
+        # Single-threaded: process inline
+        manifest_path = out_dir / "manifest.parquet"
+        manifest = Manifest(manifest_path, source=source)
+
+        for bid in range(n_buckets):
+            bucket_df = daily_all[daily_all["_bucket"] == bid].drop(columns=["_bucket"])
+            if bucket_df.empty:
+                continue
+
+            for station_key, grp in bucket_df.groupby("station_key"):
+                station_key = str(station_key)
+                grp = grp.sort_values("date").reset_index(drop=True)
+
+                if "date" in grp.columns:
+                    grp = grp.drop_duplicates(subset=["date"], keep="first")
+
+                if min_por_days > 0:
+                    obs_count = pd.to_numeric(
+                        grp.get("obs_count", pd.Series(dtype=float)), errors="coerce"
+                    )
+                    sufficient_days = int((obs_count >= 18).sum())
+                    if sufficient_days < min_por_days:
+                        continue
+
+                rso = None
+                if use_rsun_raster and station_key in station_coords:
+                    lon, lat = station_coords[station_key]
                     try:
-                        from obsmet.products.rsun import compute_rso_asce
+                        from obsmet.products.rsun import extract_station_rsun
 
-                        rso = compute_rso_asce(float(lat_val.iloc[0]), float(elev_val.iloc[0]))
+                        rso = extract_station_rsun(lon, lat, str(rsun_path))
                     except Exception:
                         pass
 
-            # Apply Tier 2 QC
-            grp = _apply_tier2_qc(grp, variable_columns, rso=rso)
+                if rso is None and "lat" in grp.columns and "elev_m" in grp.columns:
+                    lat_val = pd.to_numeric(grp["lat"], errors="coerce").dropna()
+                    elev_val = pd.to_numeric(grp["elev_m"], errors="coerce").dropna()
+                    if not lat_val.empty and not elev_val.empty:
+                        try:
+                            from obsmet.products.rsun import compute_rso_asce
 
-            safe_name = station_key.replace(":", "_").replace("/", "_")
-            out_path = out_dir / f"{safe_name}.parquet"
-            grp.to_parquet(out_path, index=False, compression="snappy")
-            manifest.update(station_key, "done", run_id=provenance.run_id)
-            stats[station_key] = len(grp)
+                            rso = compute_rso_asce(float(lat_val.iloc[0]), float(elev_val.iloc[0]))
+                        except Exception:
+                            pass
 
-        del bucket_df
+                grp = _apply_tier2_qc(grp, variable_columns, rso=rso)
 
-        if (bid + 1) % 10 == 0:
-            logger.info(
-                "  pass 2: %d/%d buckets, %d stations written", bid + 1, n_buckets, len(stats)
-            )
+                safe_name = station_key.replace(":", "_").replace("/", "_")
+                out_path = out_dir / f"{safe_name}.parquet"
+                grp.to_parquet(out_path, index=False, compression="snappy")
+                manifest.update(station_key, "done", run_id=provenance.run_id)
+                stats[station_key] = len(grp)
 
-    manifest.flush()
+            if (bid + 1) % 10 == 0:
+                logger.info(
+                    "  pass 2: %d/%d buckets, %d stations written",
+                    bid + 1,
+                    n_buckets,
+                    len(stats),
+                )
 
-    # Clean up temp dir
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+        manifest.flush()
+        del daily_all
+
+    # Write manifest for parallel path (workers can't share Manifest object)
+    if use_parallel:
+        manifest_path = out_dir / "manifest.parquet"
+        manifest = Manifest(manifest_path, source=source)
+        for sk in stats:
+            manifest.update(sk, "done", run_id=provenance.run_id)
+        manifest.flush()
+
     logger.info("Station POR complete: %d stations", len(stats))
-
     return stats
-
-
-def _spill_bucket(bucket_id: int, frames: list[pd.DataFrame], tmp_dir: Path) -> None:
-    """Write accumulated frames for one bucket to a temp parquet file."""
-    if not frames:
-        return
-    df = pd.concat(frames, ignore_index=True)
-    # Use a sequence number to allow multiple spills per bucket
-    existing = list(tmp_dir.glob(f"bucket_{bucket_id:04d}_*.parquet"))
-    seq = len(existing)
-    out = tmp_dir / f"bucket_{bucket_id:04d}_{seq:04d}.parquet"
-    df.to_parquet(out, index=False, compression="snappy")
