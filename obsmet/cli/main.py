@@ -368,6 +368,13 @@ def qaqc(source, start, end, resume, workers, overwrite, dry_run):
 @click.option("--crosswalk-path", default=None, help="Path to crosswalk.parquet")
 @click.option("--precedence-path", default=None, help="Path to precedence TOML config")
 @click.option("--out-dir", default=None, help="Override output directory")
+@click.option(
+    "--station-index-path", default=None, help="Path to station_index.parquet for Rso lookup"
+)
+@click.option("--rsun-path", default=None, help="Path to RSUN GeoTIFF for Rs QC")
+@click.option(
+    "--min-por-days", type=int, default=0, help="Min days with obs_count>=18 to write station"
+)
 @common_options
 def build(
     product,
@@ -377,6 +384,9 @@ def build(
     crosswalk_path,
     precedence_path,
     out_dir,
+    station_index_path,
+    rsun_path,
+    min_por_days,
     start,
     end,
     resume,
@@ -388,7 +398,18 @@ def build(
     if product == "daily":
         _build_daily(source, start, end, resume, workers, overwrite, dry_run)
     elif product == "station-por":
-        _build_station_por(source, start, end, resume, workers, overwrite, dry_run)
+        _build_station_por(
+            source,
+            start,
+            end,
+            resume,
+            workers,
+            overwrite,
+            dry_run,
+            station_index_path=station_index_path,
+            rsun_path=rsun_path,
+            min_por_days=min_por_days,
+        )
     elif product == "fabric":
         _build_fabric(
             bounds=bounds,
@@ -1031,7 +1052,18 @@ def _ingest_ndbc(start, end, raw_dir, resume, dry_run, **_kw):
 # --------------------------------------------------------------------------- #
 
 
-def _build_station_por(source, start, end, resume, workers, overwrite, dry_run):
+def _build_station_por(
+    source,
+    start,
+    end,
+    resume,
+    workers,
+    overwrite,
+    dry_run,
+    station_index_path=None,
+    rsun_path=None,
+    min_por_days=0,
+):
     """Build station period-of-record parquets from normalized data."""
     from pathlib import Path
 
@@ -1058,7 +1090,15 @@ def _build_station_por(source, start, end, resume, workers, overwrite, dry_run):
         click.echo(f"  {src}: building station POR → {out_dir}")
 
         stats = build_station_por(
-            src, norm_dir, out_dir, provenance, start_date=start_date, end_date=end_date
+            src,
+            norm_dir,
+            out_dir,
+            provenance,
+            start_date=start_date,
+            end_date=end_date,
+            station_index_path=station_index_path,
+            rsun_path=rsun_path,
+            min_por_days=min_por_days,
         )
         click.echo(f"  {src}: {len(stats)} stations written")
 

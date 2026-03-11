@@ -235,6 +235,13 @@ def aggregate_daily_wide(
                 rec["tmin"] = float(tair_vals.min())
                 rec["tmean"] = float(tair_vals.mean())
 
+        # RHmax/RHmin from hourly rh
+        if "rh" in grp.columns:
+            rh_vals = pd.to_numeric(grp["rh"], errors="coerce").dropna()
+            if not rh_vals.empty:
+                rec["rhmax"] = float(rh_vals.max())
+                rec["rhmin"] = float(rh_vals.min())
+
         # Convert rsds_hourly W/m² to rsds MJ/m²/day
         if "rsds_hourly" in grp.columns:
             rsds_vals = pd.to_numeric(grp["rsds_hourly"], errors="coerce").dropna()

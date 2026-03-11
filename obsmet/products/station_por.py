@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 
 _STATE_PRECEDENCE = {"fail": 2, "suspect": 1, "pass": 0}
 
+# Variables excluded from z-score (zero-inflated / skewed distributions)
+_ZSCORE_SKIP_VARS = {"prcp"}
+
+# Physical upper bound for daily precipitation (mm) — approx. world record
+_DAILY_PRCP_MAX_MM = 610.0
+
 
 def _worst_state(a: str, b: str) -> str:
     return a if _STATE_PRECEDENCE.get(a, 0) >= _STATE_PRECEDENCE.get(b, 0) else b
@@ -40,9 +46,12 @@ def _apply_tier2_qc(
 ) -> pd.DataFrame:
     """Apply Tier 2 temporal QC to a single station's daily DataFrame.
 
-    Runs MonthlyZScoreRule and StuckSensorRule on each variable column,
-    DewpointTemperatureRule cross-variable (td vs tmin),
-    RHDriftRule on rhmax/rhmin, and RsPeriodRatioRule on rsds (if Rso provided).
+    Runs MonthlyZScoreRule (excluding precip) and StuckSensorRule on each
+    variable column, DewpointTemperatureRule cross-variable (td vs tmin,
+    gated on obs_count >= 18), RHDriftRule on rhmax/rhmin with correction,
+    RsPeriodRatioRule on rsds with correction (if Rso provided), and a
+    physical upper bound on daily precipitation.
+
     Merges with existing qc_state (worst wins).
 
     Parameters
@@ -52,7 +61,7 @@ def _apply_tier2_qc(
     """
     zscore_rule = MonthlyZScoreRule()
     stuck_rule = StuckSensorRule(min_run_length=5)  # daily threshold
-    td_rule = DewpointTemperatureRule()
+    td_rule = DewpointTemperatureRule(tolerance=2.0)
     rh_drift_rule = RHDriftRule()
     rs_ratio_rule = RsPeriodRatioRule()
 
@@ -70,17 +79,16 @@ def _apply_tier2_qc(
 
         vals = pd.to_numeric(station_df[col], errors="coerce")
 
-        # Monthly z-score
-        z_states = zscore_rule.check_series(vals, dates)
-        for i, (idx, st) in enumerate(z_states.items()):
-            if st != "pass":
-                tier2_state.iloc[station_df.index.get_loc(idx)] = _worst_state(
-                    tier2_state.iloc[station_df.index.get_loc(idx)], st
-                )
-                pos = station_df.index.get_loc(idx)
-                tier2_reasons[pos].append(f"zscore_{col}")
+        # Monthly z-score (skip zero-inflated variables like precip)
+        if col not in _ZSCORE_SKIP_VARS:
+            z_states = zscore_rule.check_series(vals, dates)
+            for i, (idx, st) in enumerate(z_states.items()):
+                if st != "pass":
+                    pos = station_df.index.get_loc(idx)
+                    tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
+                    tier2_reasons[pos].append(f"zscore_{col}")
 
-        # Stuck sensor
+        # Stuck sensor (all variables)
         s_states = stuck_rule.check_series(vals)
         for idx, st in s_states.items():
             if st != "pass":
@@ -88,42 +96,76 @@ def _apply_tier2_qc(
                 tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
                 tier2_reasons[pos].append(f"stuck_{col}")
 
-    # Dewpoint-temperature daily cross-check
+    # Daily precip upper bound
+    if "prcp" in station_df.columns:
+        prcp_vals = pd.to_numeric(station_df["prcp"], errors="coerce")
+        prcp_extreme = prcp_vals > _DAILY_PRCP_MAX_MM
+        for idx in station_df.index[prcp_extreme]:
+            pos = station_df.index.get_loc(idx)
+            tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], "fail")
+            tier2_reasons[pos].append("prcp_exceeds_daily_max")
+
+    # Dewpoint-temperature daily cross-check (gated on obs_count >= 18)
     if "td" in station_df.columns and "tmin" in station_df.columns:
         td_vals = pd.to_numeric(station_df["td"], errors="coerce")
         tmin_vals = pd.to_numeric(station_df["tmin"], errors="coerce")
-        dt_states = td_rule.check_daily(td_vals, tmin_vals)
+        obs_count = pd.to_numeric(
+            station_df.get("obs_count", pd.Series(24, index=station_df.index)),
+            errors="coerce",
+        )
+        # Mask low-coverage days so check_daily sees NaN → returns "pass"
+        coverage_ok = obs_count >= 18
+        masked_td = td_vals.where(coverage_ok)
+        masked_tmin = tmin_vals.where(coverage_ok)
+        dt_states = td_rule.check_daily(masked_td, masked_tmin)
         for idx, st in dt_states.items():
             if st != "pass":
                 pos = station_df.index.get_loc(idx)
                 tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
                 tier2_reasons[pos].append("td_exceeds_tmin_daily")
 
-    # RH drift (yearly percentile correction)
+    # RH drift (yearly percentile correction) — use rhmax/rhmin if available
+    station_df = station_df.copy()
     if "rh" in station_df.columns:
-        rhmax = pd.to_numeric(station_df["rh"], errors="coerce")
-        rhmin = rhmax.copy()  # MADIS reports single RH; use as both max/min
+        if "rhmax" in station_df.columns and "rhmin" in station_df.columns:
+            rhmax = pd.to_numeric(station_df["rhmax"], errors="coerce")
+            rhmin = pd.to_numeric(station_df["rhmin"], errors="coerce")
+        else:
+            rhmax = pd.to_numeric(station_df["rh"], errors="coerce")
+            rhmin = rhmax.copy()
         years = dates.dt.year
-        rh_states = rh_drift_rule.check_series(rhmax, rhmin, years)
+        rh_states, corr_rhmax, corr_rhmin, _ = rh_drift_rule.correct_series(rhmax, rhmin, years)
         for idx, st in rh_states.items():
             if st != "pass":
                 pos = station_df.index.get_loc(idx)
                 tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
                 tier2_reasons[pos].append("rh_drift")
 
+        # Store corrected values (originals stay in base columns)
+        rh_mean = pd.to_numeric(station_df["rh"], errors="coerce").values
+        valid_orig = rhmax.values > 0
+        correction_ratio = np.ones(len(rhmax))
+        correction_ratio[valid_orig] = corr_rhmax[valid_orig] / rhmax.values[valid_orig]
+        station_df["rh_corrected"] = np.where(np.isnan(rh_mean), np.nan, rh_mean * correction_ratio)
+        station_df["rh_corrected"] = np.clip(station_df["rh_corrected"], 0, 100)
+        station_df["rhmax_corrected"] = corr_rhmax
+        station_df["rhmin_corrected"] = corr_rhmin
+
     # Rs period-ratio correction (requires RSUN Rso)
     if rso is not None and "rsds" in station_df.columns:
         rs_vals = pd.to_numeric(station_df["rsds"], errors="coerce")
         doy = dates.dt.dayofyear
-        rs_states = rs_ratio_rule.check_series(rs_vals, rso, doy)
+        rs_states, corr_rs = rs_ratio_rule.correct_series(rs_vals, rso, doy)
         for idx, st in rs_states.items():
             if st != "pass":
                 pos = station_df.index.get_loc(idx)
                 tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
                 tier2_reasons[pos].append("rs_period_ratio")
 
+        # Store corrected Rs (original stays in rsds)
+        station_df["rsds_corrected"] = corr_rs
+
     # Merge with existing qc_state
-    station_df = station_df.copy()
     if "qc_state" in station_df.columns:
         existing = station_df["qc_state"].fillna("pass")
         merged = [_worst_state(e, t) for e, t in zip(existing, tier2_state)]
@@ -162,6 +204,9 @@ def build_station_por(
     end_date=None,
     variable_columns: list[str] | None = None,
     n_buckets: int = _N_BUCKETS,
+    station_index_path: Path | str | None = None,
+    rsun_path: Path | str | None = None,
+    min_por_days: int = 0,
 ) -> dict[str, int]:
     """Build station POR parquets from normalized data.
 
@@ -263,6 +308,18 @@ def build_station_por(
     # ------------------------------------------------------------------ #
     logger.info("Pass 2: reading buckets, applying QC, writing per-station parquets")
 
+    # Load station coordinates for Rso extraction (optional)
+    station_coords: dict[str, tuple[float, float]] = {}
+    if station_index_path is not None and rsun_path is not None:
+        idx_path = Path(station_index_path)
+        if idx_path.exists():
+            idx_df = pd.read_parquet(idx_path)
+            for _, row in idx_df.iterrows():
+                key = row.get("canonical_id") or row.get("station_key")
+                if key and pd.notna(row.get("lat")) and pd.notna(row.get("lon")):
+                    station_coords[str(key)] = (float(row["lon"]), float(row["lat"]))
+            logger.info("Loaded %d station coords for Rso lookup", len(station_coords))
+
     manifest_path = out_dir / "manifest.parquet"
     manifest = Manifest(manifest_path, source=source)
     stats: dict[str, int] = {}
@@ -293,8 +350,28 @@ def build_station_por(
             if "date" in grp.columns:
                 grp = grp.drop_duplicates(subset=["date"], keep="first")
 
+            # Minimum POR filter
+            if min_por_days > 0:
+                obs_count = pd.to_numeric(
+                    grp.get("obs_count", pd.Series(dtype=float)), errors="coerce"
+                )
+                sufficient_days = int((obs_count >= 18).sum())
+                if sufficient_days < min_por_days:
+                    continue
+
+            # Look up Rso for this station (optional)
+            rso = None
+            if station_key in station_coords and rsun_path is not None:
+                lon, lat = station_coords[station_key]
+                try:
+                    from obsmet.products.rsun import extract_station_rsun
+
+                    rso = extract_station_rsun(lon, lat, str(rsun_path))
+                except Exception:
+                    pass
+
             # Apply Tier 2 QC
-            grp = _apply_tier2_qc(grp, variable_columns)
+            grp = _apply_tier2_qc(grp, variable_columns, rso=rso)
 
             safe_name = station_key.replace(":", "_").replace("/", "_")
             out_path = out_dir / f"{safe_name}.parquet"

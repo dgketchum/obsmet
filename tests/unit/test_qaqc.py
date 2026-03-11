@@ -279,6 +279,28 @@ class TestRHDrift:
         # With RHmax never hitting 100, correction factor ~1.43 → fail
         assert (states != "pass").sum() > 0
 
+    def test_correct_series_returns_corrected_values(self):
+        """correct_series() should return 4-tuple with corrected arrays."""
+        rng = np.random.default_rng(42)
+        n = 365 * 2
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        rhmax = pd.Series(rng.uniform(40, 70, n), index=range(n))
+        rhmin = pd.Series(rng.uniform(20, 50, n), index=range(n))
+        years = pd.Series(dates.year.values, index=range(n))
+
+        rule = RHDriftRule()
+        result = rule.correct_series(rhmax, rhmin, years)
+        assert len(result) == 4
+        states, corr_rhmax, corr_rhmin, year_factors = result
+        assert isinstance(states, pd.Series)
+        assert isinstance(corr_rhmax, np.ndarray)
+        assert isinstance(corr_rhmin, np.ndarray)
+        assert isinstance(year_factors, dict)
+        assert len(corr_rhmax) == n
+        # Corrected values should be clipped to [0, 100]
+        assert np.nanmax(corr_rhmax) <= 100.0
+        assert np.nanmin(corr_rhmin[~np.isnan(corr_rhmin)]) >= 0.0
+
 
 class TestRsPeriodRatio:
     def test_clean_data_mostly_passes(self):
@@ -315,6 +337,25 @@ class TestRsPeriodRatio:
         states = rule.check_series(rs_series, rso, doy)
         # At least some days should be flagged
         assert (states != "pass").sum() > 0
+
+    def test_correct_series_returns_corrected_values(self):
+        """correct_series() should return 2-tuple with corrected array."""
+        rng = np.random.default_rng(42)
+        n = 365
+        rso = np.sin(np.linspace(0, np.pi, 365)) * 300 + 100
+        rs = rso * 0.90 + rng.normal(0, 5, n)
+        rs[rs < 0] = 0
+
+        rs_series = pd.Series(rs, index=range(n))
+        doy = pd.Series(np.arange(1, 366), index=range(n))
+
+        rule = RsPeriodRatioRule()
+        result = rule.correct_series(rs_series, rso, doy)
+        assert len(result) == 2
+        states, corr_rs = result
+        assert isinstance(states, pd.Series)
+        assert isinstance(corr_rs, np.ndarray)
+        assert len(corr_rs) == n
 
 
 class TestCompiledHumidity:

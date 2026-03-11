@@ -326,6 +326,61 @@ class RHDriftRule(QCRule):
             state="pass", reason="rh_drift_no_context", tier=self.tier, rule_name=self.name
         )
 
+    def _compute_rh_correction(
+        self,
+        rhmax: pd.Series,
+        rhmin: pd.Series,
+        years: pd.Series,
+    ) -> tuple[pd.Series, np.ndarray, np.ndarray, dict[int, float]]:
+        """Shared RH correction logic.
+
+        Returns (state_series, corrected_rhmax, corrected_rhmin, year_factors).
+        """
+        result = pd.Series("pass", index=rhmax.index)
+        rh_max_arr = rhmax.values.astype(np.float64).copy()
+        rh_min_arr = rhmin.values.astype(np.float64).copy()
+        year_arr = years.values.astype(np.int32)
+
+        n = len(rh_max_arr)
+        if n < 365:
+            return result, rh_max_arr, rh_min_arr, {}
+
+        log_buf = io.StringIO()
+        with redirect_stdout(io.StringIO()):
+            corr_rhmax, corr_rhmin = rh_yearly_percentile_corr(
+                log_buf, 0, n, rh_max_arr, rh_min_arr, year_arr, self.percentage
+            )
+
+        # Clip corrected values to [0, 100]
+        corr_rhmax = np.clip(corr_rhmax, 0, 100)
+        corr_rhmin = np.clip(corr_rhmin, 0, 100)
+
+        # Compute per-year correction factor: corr / original
+        year_factors: dict[int, float] = {}
+        unique_years = np.unique(year_arr)
+        for yr in unique_years:
+            yr_mask = year_arr == yr
+            orig_vals = rh_max_arr[yr_mask]
+            corr_vals = corr_rhmax[yr_mask]
+
+            valid = ~np.isnan(orig_vals) & ~np.isnan(corr_vals) & (orig_vals > 0)
+            if not np.any(valid):
+                continue
+
+            factors = corr_vals[valid] / orig_vals[valid]
+            mean_factor = float(np.nanmean(factors))
+            year_factors[int(yr)] = mean_factor
+
+            yr_idx = rhmax.index[yr_mask]
+            if mean_factor >= self.fail_corr_factor or mean_factor <= (1 / self.fail_corr_factor):
+                result.loc[yr_idx] = "fail"
+            elif mean_factor >= self.suspect_corr_factor or mean_factor <= (
+                1 / self.suspect_corr_factor
+            ):
+                result.loc[yr_idx] = "suspect"
+
+        return result, corr_rhmax, corr_rhmin, year_factors
+
     def check_series(
         self,
         rhmax: pd.Series,
@@ -341,44 +396,20 @@ class RHDriftRule(QCRule):
         years : pd.Series
             Year for each observation (aligned index).
         """
-        result = pd.Series("pass", index=rhmax.index)
-        rh_max_arr = rhmax.values.astype(np.float64).copy()
-        rh_min_arr = rhmin.values.astype(np.float64).copy()
-        year_arr = years.values.astype(np.int32)
+        states, _, _, _ = self._compute_rh_correction(rhmax, rhmin, years)
+        return states
 
-        n = len(rh_max_arr)
-        if n < 365:
-            return result
+    def correct_series(
+        self,
+        rhmax: pd.Series,
+        rhmin: pd.Series,
+        years: pd.Series,
+    ) -> tuple[pd.Series, np.ndarray, np.ndarray, dict[int, float]]:
+        """Flag drift AND return corrected RH arrays.
 
-        log_buf = io.StringIO()
-        with redirect_stdout(io.StringIO()):
-            corr_rhmax, _ = rh_yearly_percentile_corr(
-                log_buf, 0, n, rh_max_arr, rh_min_arr, year_arr, self.percentage
-            )
-
-        # Compute per-year correction factor: corr / original
-        unique_years = np.unique(year_arr)
-        for yr in unique_years:
-            yr_mask = year_arr == yr
-            orig_vals = rh_max_arr[yr_mask]
-            corr_vals = corr_rhmax[yr_mask]
-
-            valid = ~np.isnan(orig_vals) & ~np.isnan(corr_vals) & (orig_vals > 0)
-            if not np.any(valid):
-                continue
-
-            factors = corr_vals[valid] / orig_vals[valid]
-            mean_factor = np.nanmean(factors)
-
-            yr_idx = rhmax.index[yr_mask]
-            if mean_factor >= self.fail_corr_factor or mean_factor <= (1 / self.fail_corr_factor):
-                result.loc[yr_idx] = "fail"
-            elif mean_factor >= self.suspect_corr_factor or mean_factor <= (
-                1 / self.suspect_corr_factor
-            ):
-                result.loc[yr_idx] = "suspect"
-
-        return result
+        Returns (states, corrected_rhmax, corrected_rhmin, year_factors).
+        """
+        return self._compute_rh_correction(rhmax, rhmin, years)
 
 
 # --------------------------------------------------------------------------- #
@@ -412,6 +443,49 @@ class RsPeriodRatioRule(QCRule):
             state="pass", reason="rs_ratio_no_context", tier=self.tier, rule_name=self.name
         )
 
+    def _compute_rs_correction(
+        self,
+        rs: pd.Series,
+        rso: np.ndarray,
+        doy: pd.Series,
+    ) -> tuple[pd.Series, np.ndarray]:
+        """Shared Rs correction logic.
+
+        Returns (state_series, corrected_rs_array).
+        """
+        result = pd.Series("pass", index=rs.index)
+        rs_arr = rs.values.astype(np.float64).copy()
+        n = len(rs_arr)
+        if n < self.period:
+            return result, rs_arr
+
+        # Build per-day Rso from DOY lookup
+        rso_arr = rso[(doy.values.astype(int) - 1) % 365].astype(np.float64)
+
+        log_buf = io.StringIO()
+        with redirect_stdout(io.StringIO()):
+            corr_rs, _ = rs_period_ratio_corr(
+                log_buf, 0, n, rs_arr, rso_arr, self.sample_size, self.period
+            )
+
+        # Days where the value was replaced or NaN'd → fail
+        was_valid = ~np.isnan(rs_arr)
+        now_nan = np.isnan(corr_rs)
+        removed = was_valid & now_nan
+        result.loc[rs.index[removed]] = "fail"
+
+        # Days that were significantly corrected (>10% change) → suspect
+        both_valid = was_valid & ~now_nan & (rs_arr > 0)
+        if np.any(both_valid):
+            change = np.abs(corr_rs[both_valid] - rs_arr[both_valid]) / rs_arr[both_valid]
+            sig_change = np.zeros(n, dtype=bool)
+            sig_change[both_valid] = change > 0.10
+            # Don't downgrade fail to suspect
+            suspect_only = sig_change & (result.values != "fail")
+            result.loc[rs.index[suspect_only]] = "suspect"
+
+        return result, corr_rs
+
     def check_series(
         self,
         rs: pd.Series,
@@ -429,36 +503,17 @@ class RsPeriodRatioRule(QCRule):
         doy : pd.Series
             Day-of-year for each observation (1-365, aligned index).
         """
-        result = pd.Series("pass", index=rs.index)
-        rs_arr = rs.values.astype(np.float64).copy()
-        n = len(rs_arr)
-        if n < self.period:
-            return result
+        states, _ = self._compute_rs_correction(rs, rso, doy)
+        return states
 
-        # Build per-day Rso from DOY lookup
-        rso_arr = rso[(doy.values.astype(int) - 1) % 365].astype(np.float64)
+    def correct_series(
+        self,
+        rs: pd.Series,
+        rso: np.ndarray,
+        doy: pd.Series,
+    ) -> tuple[pd.Series, np.ndarray]:
+        """Flag drift AND return corrected Rs array.
 
-        log_buf = io.StringIO()
-        with redirect_stdout(io.StringIO()):
-            corr_rs, _ = rs_period_ratio_corr(
-                log_buf, 0, n, rs_arr, rso_arr, self.sample_size, self.period
-            )
-
-        # Days where the value was replaced (spike detection marker -12345 → set to Rso*1.05)
-        # or NaN'd (insufficient data / extreme correction factor) → fail
-        was_valid = ~np.isnan(rs_arr)
-        now_nan = np.isnan(corr_rs)
-        removed = was_valid & now_nan
-        result.loc[rs.index[removed]] = "fail"
-
-        # Days that were significantly corrected (>10% change) → suspect
-        both_valid = was_valid & ~now_nan & (rs_arr > 0)
-        if np.any(both_valid):
-            change = np.abs(corr_rs[both_valid] - rs_arr[both_valid]) / rs_arr[both_valid]
-            sig_change = np.zeros(n, dtype=bool)
-            sig_change[both_valid] = change > 0.10
-            # Don't downgrade fail to suspect
-            suspect_only = sig_change & (result.values != "fail")
-            result.loc[rs.index[suspect_only]] = "suspect"
-
-        return result
+        Returns (states, corrected_rs_array).
+        """
+        return self._compute_rs_correction(rs, rso, doy)

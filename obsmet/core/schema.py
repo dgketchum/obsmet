@@ -81,7 +81,14 @@ DAILY_METRIC_FIELDS = [
     pa.field("vpd", pa.float64()),
     pa.field("u2", pa.float64()),
     pa.field("rsds", pa.float64()),
+    pa.field("rsds_corrected", pa.float64()),
     pa.field("prcp", pa.float64()),
+    # Humidity extremes + corrections
+    pa.field("rhmax", pa.float64()),
+    pa.field("rhmin", pa.float64()),
+    pa.field("rh_corrected", pa.float64()),
+    pa.field("rhmax_corrected", pa.float64()),
+    pa.field("rhmin_corrected", pa.float64()),
     # Snow / cryosphere
     pa.field("swe", pa.float64()),  # snow water equivalent (mm)
     pa.field("snow_depth", pa.float64()),  # snow depth (mm)
