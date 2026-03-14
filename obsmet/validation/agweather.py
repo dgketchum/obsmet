@@ -33,13 +33,14 @@ RS_CONV = 86400 / 1e6  # = 0.0864
 
 # Map our qc_reason_codes to the agweather variable(s) they govern
 RULE_TO_AGW_VARS: dict[str, list[str]] = {
-    "zscore_tair": ["tmax", "tmin", "tmean"],
+    "zscore_tmax": ["tmax"],
+    "zscore_tmin": ["tmin"],
+    "zscore_tmean": ["tmean"],
     "zscore_td": ["td"],
     "zscore_rh": ["rh", "rhmax", "rhmin"],
     "zscore_prcp": ["prcp"],
     "zscore_wind": ["wind"],
     "td_exceeds_tmin_daily": ["td", "tmin"],
-    "rh_drift": ["rh", "rhmax", "rhmin"],
     "stuck_sensor": ["tmax", "tmin", "td", "rh", "wind", "prcp", "rsds"],
     "rs_period_ratio": ["rsds"],
 }

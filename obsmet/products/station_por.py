@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 _STATE_PRECEDENCE = {"fail": 2, "suspect": 1, "pass": 0}
 
 # Variables excluded from z-score (zero-inflated / skewed / event-driven distributions)
-_ZSCORE_SKIP_VARS = {"prcp", "wind"}
+_ZSCORE_SKIP_VARS = {"prcp", "wind", "tair"}  # tair is redundant with tmean
 
 # Physical upper bound for daily precipitation (mm) — approx. world record
 _DAILY_PRCP_MAX_MM = 610.0
@@ -108,12 +108,8 @@ def _apply_tier2_qc(
             rhmax = pd.to_numeric(station_df["rh"], errors="coerce")
             rhmin = rhmax.copy()
         years = dates.dt.year
-        rh_states, corr_rhmax, corr_rhmin, _ = rh_drift_rule.correct_series(rhmax, rhmin, years)
-        for idx, st in rh_states.items():
-            if st != "pass":
-                pos = station_df.index.get_loc(idx)
-                tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
-                tier2_reasons[pos].append("rh_drift")
+        _, corr_rhmax, corr_rhmin, _ = rh_drift_rule.correct_series(rhmax, rhmin, years)
+        # rh_drift corrects but never flags — agweather never NaN's due to RH drift
 
         # Store corrected values (originals stay in base columns)
         rh_mean = pd.to_numeric(station_df["rh"], errors="coerce").values

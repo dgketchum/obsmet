@@ -79,8 +79,8 @@ class TestBuildStationPor:
 
             # Need ~4 years for >=90 obs per calendar month (z-score threshold)
             df = self._make_hourly_df("madis:STN_A", n_hours=365 * 4 * 24)
-            # Inject extreme outlier on one day
-            df.loc[df.index[:24], "tair"] = 60.0
+            # Inject extreme outlier on one day (tair is skipped; use td)
+            df.loc[df.index[:24], "td"] = 60.0
             df.to_parquet(norm_dir / "day1.parquet", index=False)
 
             provenance = RunProvenance(source="madis", command="test")
