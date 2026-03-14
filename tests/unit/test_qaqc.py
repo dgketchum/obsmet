@@ -320,23 +320,25 @@ class TestRsPeriodRatio:
         assert (states == "fail").sum() < n * 0.1
 
     def test_spike_detected(self):
-        """Inject spikes below 2×rso_max — should be flagged as fail."""
-        rng = np.random.default_rng(42)
-        n = 365
-        rso = np.sin(np.linspace(0, np.pi, 365)) * 300 + 100  # max ~400
-        rs = rso * 0.75 + rng.normal(0, 10, n)
-        rs[rs < 0] = 0
-        # Inject spikes below 2×rso_max (800) so they pass the overflow filter
-        rs[10] = 600.0
-        rs[11] = 700.0
+        """Period where rs >> rso forces CF < 0.5 → NaN-ification; rs > rso days must be flagged.
 
-        rs_series = pd.Series(rs, index=range(n))
-        doy = pd.Series(np.arange(1, 366), index=range(n))
+        Uses small rso (max ≈ 30) so rs = 2.5×rso stays below the 2×rso_max overflow guard.
+        CF = rso / (2.5×rso) = 0.40 < 0.50 → algorithm NaN-ifies the whole period.
+        Those NaN-ified days also have rs > rso → flagged as fail.
+        """
+        rso = np.sin(np.linspace(0, np.pi, 365)) * 20 + 10  # max ≈ 30; 2×max ≈ 60
+        rs = rso[:180] * 0.75  # normal background for periods 1–2
+        # Period 0 (days 0–59): rs = 2.5×rso → CF = 0.40 < 0.50 → period NaN'd
+        # rs ≈ 25–42 MJ/m²/day, all below the overflow guard (≈60)
+        rs[:60] = rso[:60] * 2.5
+
+        rs_series = pd.Series(rs, index=range(180))
+        doy = pd.Series(np.arange(1, 181))
 
         rule = RsPeriodRatioRule()
         states = rule.check_series(rs_series, rso, doy)
-        # At least some days should be flagged
-        assert (states != "pass").sum() > 0
+        # Days 0–59: rs > rso AND period NaN'd → must be flagged
+        assert (states.iloc[:60] != "pass").sum() > 0, "overestimate period must produce fail flags"
 
     def test_corrected_days_not_suspect(self):
         """Fix 1: days corrected by >10% must never be marked suspect (block removed).
@@ -376,6 +378,30 @@ class TestRsPeriodRatio:
         assert isinstance(states, pd.Series)
         assert isinstance(corr_rs, np.ndarray)
         assert len(corr_rs) == n
+
+    def test_zero_rsds_not_flagged(self):
+        """Zero rsds days must never be flagged (they encode missing data, not zero radiation)."""
+        rso = np.sin(np.linspace(0, np.pi, 365)) * 20 + 10
+        rs = rso * 0.75
+        rs[::7] = 0.0  # inject zeros every 7th day (nighttime-only coverage)
+        rule = RsPeriodRatioRule()
+        states = rule.check_series(pd.Series(rs), rso, pd.Series(np.arange(1, 366)))
+        zero_positions = np.where(rs == 0)[0]
+        for i in zero_positions:
+            assert states.iloc[i] == "pass", f"zero day {i} should not be flagged"
+
+    def test_cf_instability_not_flagged(self):
+        """Days removed by CF > 1.5 (overcast period) must not be flagged when rs ≤ rso."""
+        rso = np.sin(np.linspace(0, np.pi, 365)) * 20 + 10
+        rs = rso[:180] * 0.75
+        # First 60 days: very low rs/rso (≈0.10) forces CF ≈ 10 > 1.5 → algorithm NaN-ifies period
+        rs[:60] = rso[:60] * 0.10
+        rule = RsPeriodRatioRule()
+        states = rule.check_series(pd.Series(rs), rso, pd.Series(np.arange(1, 181)))
+        # All 60 days have rs ≤ rso → must not be flagged regardless of CF instability
+        assert (states.iloc[:60] == "pass").all(), (
+            "CF-instability days (rs ≤ rso) must not be flagged"
+        )
 
     def test_exact_multiple_of_period_returns_full_length(self):
         """Exact 60-day multiples should not trigger the upstream shape bug."""

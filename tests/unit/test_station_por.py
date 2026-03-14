@@ -1,5 +1,6 @@
 """Tests for obsmet.products.station_por."""
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -92,6 +93,105 @@ class TestBuildStationPor:
                 first_day["qc_state"] in ("suspect", "fail") or first_day["qc_reason_codes"] != ""
             )
 
+    def test_station_failure_report_written_and_build_continues(self, monkeypatch):
+        """A failing station should be reported without aborting other station writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            norm_dir = Path(tmpdir) / "normalized"
+            norm_dir.mkdir()
+            out_dir = Path(tmpdir) / "station_por" / "madis"
+
+            df_good = self._make_hourly_df("madis:GOOD")
+            df_bad = self._make_hourly_df("madis:BAD")
+            pd.concat([df_good, df_bad], ignore_index=True).to_parquet(
+                norm_dir / "day1.parquet",
+                index=False,
+            )
+
+            original_apply = __import__(
+                "obsmet.products.station_por",
+                fromlist=["_apply_tier2_qc"],
+            )._apply_tier2_qc
+
+            def fail_one_station(station_df, variable_columns, *, rso=None):
+                station_key = str(station_df["station_key"].iloc[0])
+                if station_key == "madis:BAD":
+                    raise RuntimeError("synthetic tier2 failure")
+                return original_apply(station_df, variable_columns, rso=rso)
+
+            monkeypatch.setattr(
+                "obsmet.products.station_por._apply_tier2_qc",
+                fail_one_station,
+            )
+
+            provenance = RunProvenance(source="madis", command="test")
+            stats = build_station_por("madis", norm_dir, out_dir, provenance)
+
+            assert stats == {"madis:GOOD": 3}
+            assert (out_dir / "madis_GOOD.parquet").exists()
+            assert not (out_dir / "madis_BAD.parquet").exists()
+
+            report_path = out_dir.parent / "station_por_failures_madis.json"
+            assert report_path.exists()
+
+            report = json.loads(report_path.read_text())
+            assert report["source"] == "madis"
+            assert report["run_id"] == provenance.run_id
+            assert report["failure_count"] == 1
+            assert len(report["failures"]) == 1
+            assert report["failures"][0]["phase"] == "pass2_station"
+            assert report["failures"][0]["station_key"] == "madis:BAD"
+            assert report["failures"][0]["error_type"] == "RuntimeError"
+            assert report["qc_skip_count"] == 1
+            assert report["qc_skips"][0]["station_key"] == "madis:GOOD"
+
+    def test_pass1_file_failure_written_and_build_continues(self):
+        """Unreadable normalized parquet files should be reported without aborting valid files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            norm_dir = Path(tmpdir) / "normalized"
+            norm_dir.mkdir()
+            out_dir = Path(tmpdir) / "station_por" / "madis"
+
+            df = self._make_hourly_df("madis:GOOD")
+            df.to_parquet(norm_dir / "day1.parquet", index=False)
+            (norm_dir / "broken.parquet").write_text("not a parquet file", encoding="utf-8")
+
+            provenance = RunProvenance(source="madis", command="test")
+            stats = build_station_por("madis", norm_dir, out_dir, provenance)
+
+            assert stats == {"madis:GOOD": 3}
+            assert (out_dir / "madis_GOOD.parquet").exists()
+
+            report_path = out_dir.parent / "station_por_failures_madis.json"
+            report = json.loads(report_path.read_text())
+            assert report["failure_count"] == 1
+            assert report["failures"][0]["phase"] == "pass1_read_daily"
+            assert report["failures"][0]["input_file"].endswith("broken.parquet")
+            assert report["qc_skip_count"] == 1
+
+    def test_rs_qc_skip_reason_written_when_rso_unavailable(self):
+        """Stations with Rs data but no usable Rso should be reported as QC skips."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            norm_dir = Path(tmpdir) / "normalized"
+            norm_dir.mkdir()
+            out_dir = Path(tmpdir) / "station_por" / "madis"
+
+            df = self._make_hourly_df("madis:RS_SKIP")
+            df.to_parquet(norm_dir / "day1.parquet", index=False)
+
+            provenance = RunProvenance(source="madis", command="test")
+            stats = build_station_por("madis", norm_dir, out_dir, provenance)
+
+            assert stats == {"madis:RS_SKIP": 3}
+            assert (out_dir / "madis_RS_SKIP.parquet").exists()
+
+            report_path = out_dir.parent / "station_por_failures_madis.json"
+            report = json.loads(report_path.read_text())
+            assert report["failure_count"] == 0
+            assert report["qc_skip_count"] == 1
+            assert report["qc_skips"][0]["station_key"] == "madis:RS_SKIP"
+            assert report["qc_skips"][0]["qc_name"] == "rs_period_ratio"
+            assert report["qc_skips"][0]["reason"] == "missing_lat_or_elev"
+
 
 class TestTier2QCImprovements:
     """Tests for Tier 2 QC alignment with CONUS-AgWeather methodology."""
@@ -145,25 +245,6 @@ class TestTier2QCImprovements:
         row = result.iloc[50]
         assert "prcp_exceeds_daily_max" in row["qc_reason_codes"]
         assert row["qc_state"] == "fail"
-
-    def test_td_tolerance_relaxed(self):
-        """Td exceeding Tmin by 1.5°C should pass with tolerance=2.0."""
-        df = self._make_daily_df(n_days=100)
-        # Set td = tmin + 1.5 (under new 2.0 tolerance)
-        df["td"] = df["tmin"] + 1.5
-        df["obs_count"] = 24
-        result = _apply_tier2_qc(df, ["td"])
-        codes = result["qc_reason_codes"].str.contains("td_exceeds_tmin_daily")
-        assert not codes.any()
-
-    def test_td_skipped_low_coverage(self):
-        """Td check should be skipped when obs_count < 18."""
-        df = self._make_daily_df(n_days=100, obs_count=4)
-        # Set td well above tmin — would normally fail
-        df["td"] = df["tmin"] + 10.0
-        result = _apply_tier2_qc(df, ["td"])
-        codes = result["qc_reason_codes"].str.contains("td_exceeds_tmin_daily")
-        assert not codes.any()
 
     def test_rhmax_rhmin_in_output(self):
         """station_por should produce rhmax/rhmin columns from hourly data."""

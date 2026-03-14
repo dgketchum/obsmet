@@ -19,7 +19,6 @@ from obsmet.core.manifest import Manifest
 from obsmet.core.provenance import RunProvenance
 from obsmet.core.time_policy import aggregate_daily_wide
 from obsmet.qaqc.rules.temporal import (
-    DewpointTemperatureRule,
     MonthlyZScoreRule,
     RHDriftRule,
     RsPeriodRatioRule,
@@ -48,11 +47,10 @@ def _apply_tier2_qc(
 ) -> pd.DataFrame:
     """Apply Tier 2 temporal QC to a single station's daily DataFrame.
 
-    Runs MonthlyZScoreRule (excluding precip) and StuckSensorRule on each
-    variable column, DewpointTemperatureRule cross-variable (td vs tmin,
-    gated on obs_count >= 18), RHDriftRule on rhmax/rhmin with correction,
-    RsPeriodRatioRule on rsds with correction (if Rso provided), and a
-    physical upper bound on daily precipitation.
+    Runs MonthlyZScoreRule (excluding precip) on each variable column,
+    RHDriftRule on rhmax/rhmin with correction, RsPeriodRatioRule on rsds
+    with correction (if Rso provided), and a physical upper bound on daily
+    precipitation.
 
     Merges with existing qc_state (worst wins).
 
@@ -63,7 +61,6 @@ def _apply_tier2_qc(
         Rs period-ratio correction.  From RSUN raster or ASCE flat-earth.
     """
     zscore_rule = MonthlyZScoreRule()
-    td_rule = DewpointTemperatureRule(tolerance=3.0)
     rh_drift_rule = RHDriftRule()
     rs_ratio_rule = RsPeriodRatioRule()
 
@@ -100,25 +97,6 @@ def _apply_tier2_qc(
             pos = station_df.index.get_loc(idx)
             tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], "fail")
             tier2_reasons[pos].append("prcp_exceeds_daily_max")
-
-    # Dewpoint-temperature daily cross-check (gated on obs_count >= 18)
-    if "td" in station_df.columns and "tmin" in station_df.columns:
-        td_vals = pd.to_numeric(station_df["td"], errors="coerce")
-        tmin_vals = pd.to_numeric(station_df["tmin"], errors="coerce")
-        obs_count = pd.to_numeric(
-            station_df.get("obs_count", pd.Series(24, index=station_df.index)),
-            errors="coerce",
-        )
-        # Mask low-coverage days so check_daily sees NaN → returns "pass"
-        coverage_ok = obs_count >= 18
-        masked_td = td_vals.where(coverage_ok)
-        masked_tmin = tmin_vals.where(coverage_ok)
-        dt_states = td_rule.check_daily(masked_td, masked_tmin)
-        for idx, st in dt_states.items():
-            if st != "pass":
-                pos = station_df.index.get_loc(idx)
-                tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
-                tier2_reasons[pos].append("td_exceeds_tmin_daily")
 
     # RH drift (yearly percentile correction) — use rhmax/rhmin if available
     station_df = station_df.copy()

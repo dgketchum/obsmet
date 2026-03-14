@@ -465,6 +465,7 @@ class RsPeriodRatioRule(QCRule):
         # Cap values exceeding 2 × peak Rso to prevent float overflow in correction
         rso_max = float(np.nanmax(rso_arr)) if rso_arr.size else 50.0
         rs_arr = np.where(rs_arr > 2.0 * rso_max, np.nan, rs_arr)
+        rs_arr[rs_arr == 0] = np.nan  # Zero rsds encodes no valid daytime obs, not zero radiation
 
         corr_input = rs_arr
         rso_input = rso_arr
@@ -491,11 +492,14 @@ class RsPeriodRatioRule(QCRule):
             )
         corr_rs = np.asarray(corr_rs[:n], dtype=np.float64)
 
-        # Days where the value was replaced or NaN'd → fail
+        # Flag only days where the removed value exceeded clear-sky Rso —
+        # a strict physical violation. CF-instability removals (rs ≤ rso) are
+        # artifacts of cloudy or short-record periods, not measurement errors.
         was_valid = ~np.isnan(rs_arr)
         now_nan = np.isnan(corr_rs)
         removed = was_valid & now_nan
-        result.loc[rs.index[removed]] = "fail"
+        overestimate = rs_arr > rso_arr
+        result.loc[rs.index[removed & overestimate]] = "fail"
 
         return result, corr_rs
 
