@@ -492,6 +492,146 @@ def crosswalk_build(index_path, out_dir, start, end, resume, workers, overwrite,
     )
 
 
+@crosswalk.command("precedence-study")
+@click.option(
+    "--bounds",
+    default="-114.325,45.6,-113.6,47.0",
+    help="AOI bounds as west,south,east,north",
+)
+@click.option("--name", default="bitterroot", help="AOI name for output filenames")
+@click.option("--norm-base", default=None, help="Root normalized directory")
+@click.option("--station-por-base", default=None, help="Root station_por directory")
+@click.option("--artifacts-dir", default=None, help="Output artifact directory")
+@click.option("--sample-days", type=int, default=180, help="Days to sample for per-day sources")
+@click.option("--source", multiple=True, help="Restrict to one or more sources")
+@click.option("--dry-run", is_flag=True, help="Show what would be done")
+def crosswalk_precedence_study(
+    bounds,
+    name,
+    norm_base,
+    station_por_base,
+    artifacts_dir,
+    sample_days,
+    source,
+    dry_run,
+):
+    """Build AOI-specific precedence-study artifacts for duplicated stations."""
+    import logging
+    from pathlib import Path
+
+    from obsmet.crosswalk.precedence_study import (
+        BITTERROOT_BOUNDS,
+        DEFAULT_ARTIFACTS_DIR,
+        DEFAULT_NORM_BASE,
+        DEFAULT_STATION_POR_BASE,
+        run_precedence_study,
+    )
+
+    logging.basicConfig(level=logging.INFO)
+
+    parsed_bounds = BITTERROOT_BOUNDS
+    if bounds:
+        parsed_bounds = tuple(float(x) for x in bounds.split(","))
+
+    norm_root = Path(norm_base) if norm_base else DEFAULT_NORM_BASE
+    station_por_root = Path(station_por_base) if station_por_base else DEFAULT_STATION_POR_BASE
+    out_dir = Path(artifacts_dir) if artifacts_dir else DEFAULT_ARTIFACTS_DIR
+    sources = list(source) if source else None
+
+    if dry_run:
+        click.echo(f"Would run precedence study name={name}")
+        click.echo(f"  bounds: {parsed_bounds}")
+        click.echo(f"  normalized: {norm_root}")
+        click.echo(f"  station_por: {station_por_root}")
+        click.echo(f"  artifacts: {out_dir}")
+        click.echo(f"  sample_days: {sample_days}")
+        click.echo(f"  sources: {sources if sources else 'auto-detect'}")
+        return
+
+    stats = run_precedence_study(
+        bounds=parsed_bounds,
+        aoi_name=name,
+        norm_base=norm_root,
+        station_por_base=station_por_root,
+        artifacts_dir=out_dir,
+        sources=sources,
+        sample_days=sample_days,
+    )
+    click.echo(
+        f"Precedence study {name}: "
+        f"{stats['station_index_aoi_rows']} stations in AOI, "
+        f"{stats['duplicate_candidates']} duplicate candidates, "
+        f"{stats['precedence_evidence_rows']} evidence rows → {out_dir}"
+    )
+
+
+@crosswalk.command("agweather-validate")
+@click.option("--matches-csv", default=None, help="Path to agweather_madis_matches.csv")
+@click.option("--agw-base", default=None, help="Root of CONUS-AgWeather_v1 directory")
+@click.option("--por-base", default=None, help="Root of madis station_por directory")
+@click.option("--out-dir", default=None, help="Output directory for artifacts")
+@click.option("--max-dist-m", type=float, default=500.0, help="Max station distance filter (m)")
+@click.option("--max-elev-diff-m", type=float, default=50.0, help="Max elevation diff filter (m)")
+@click.option("--min-overlap-days", type=int, default=365, help="Min overlapping days required")
+@click.option("--limit", type=int, default=None, help="Process only first N pairs (for testing)")
+@click.option("--dry-run", is_flag=True, help="Show what would be done")
+def crosswalk_agweather_validate(
+    matches_csv,
+    agw_base,
+    por_base,
+    out_dir,
+    max_dist_m,
+    max_elev_diff_m,
+    min_overlap_days,
+    limit,
+    dry_run,
+):
+    """Validate MADIS Tier-2 QC against CONUS-AgWeather v1 post-QC data."""
+    import logging
+    from pathlib import Path
+
+    from obsmet.validation.agweather import (
+        DEFAULT_AGW_BASE,
+        DEFAULT_MATCHES_CSV,
+        DEFAULT_OUT_DIR,
+        DEFAULT_POR_BASE,
+        run_agweather_validation,
+    )
+
+    logging.basicConfig(level=logging.INFO)
+
+    m_csv = Path(matches_csv) if matches_csv else DEFAULT_MATCHES_CSV
+    agw = Path(agw_base) if agw_base else DEFAULT_AGW_BASE
+    por = Path(por_base) if por_base else DEFAULT_POR_BASE
+    out = Path(out_dir) if out_dir else DEFAULT_OUT_DIR
+
+    if dry_run:
+        click.echo("Would run agweather validation:")
+        click.echo(f"  matches:  {m_csv}")
+        click.echo(f"  agw_base: {agw}")
+        click.echo(f"  por_base: {por}")
+        click.echo(f"  out_dir:  {out}")
+        click.echo(
+            f"  max_dist_m={max_dist_m}  max_elev_diff_m={max_elev_diff_m}  min_overlap_days={min_overlap_days}  limit={limit}"
+        )
+        return
+
+    stats = run_agweather_validation(
+        matches_csv=m_csv,
+        agw_base=agw,
+        por_base=por,
+        out_dir=out,
+        max_dist_m=max_dist_m,
+        max_elev_diff_m=max_elev_diff_m,
+        min_overlap_days=min_overlap_days,
+        limit=limit,
+    )
+    click.echo(
+        f"Validation complete: {stats.get('pairs_compared')} pairs, "
+        f"{stats.get('total_rows')} rows → {stats.get('outputs')}"
+    )
+
+
 @cli.group()
 def corrections():
     """Correction-factor commands."""
