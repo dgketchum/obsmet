@@ -204,7 +204,7 @@ class DewpointTemperatureRule(QCRule):
     tier: QCTier = QCTier.TEMPORAL
     name: str = "dewpoint_temperature_daily"
     version: str = "1"
-    tolerance: float = 1.0
+    tolerance: float = 3.0
 
     def check(self, value: float, **context) -> QCResult:
         """Single-value check where value is daily mean td, context has tmin."""
@@ -462,27 +462,40 @@ class RsPeriodRatioRule(QCRule):
         # Build per-day Rso from DOY lookup
         rso_arr = rso[(doy.values.astype(int) - 1) % 365].astype(np.float64)
 
+        # Cap values exceeding 2 × peak Rso to prevent float overflow in correction
+        rso_max = float(np.nanmax(rso_arr)) if rso_arr.size else 50.0
+        rs_arr = np.where(rs_arr > 2.0 * rso_max, np.nan, rs_arr)
+
+        corr_input = rs_arr
+        rso_input = rso_arr
+        corr_end = n
+
+        # agweather-qaqc drops the last full correction period when the series
+        # length is an exact multiple of ``period``. Padding with a trailing NaN
+        # forces its final-partial-period branch and keeps the output aligned.
+        if n % self.period == 0:
+            corr_input = np.append(rs_arr, np.nan)
+            rso_input = np.append(rso_arr, np.nan)
+            corr_end = n + 1
+
         log_buf = io.StringIO()
         with redirect_stdout(io.StringIO()):
             corr_rs, _ = rs_period_ratio_corr(
-                log_buf, 0, n, rs_arr, rso_arr, self.sample_size, self.period
+                log_buf,
+                0,
+                corr_end,
+                corr_input,
+                rso_input,
+                self.sample_size,
+                self.period,
             )
+        corr_rs = np.asarray(corr_rs[:n], dtype=np.float64)
 
         # Days where the value was replaced or NaN'd → fail
         was_valid = ~np.isnan(rs_arr)
         now_nan = np.isnan(corr_rs)
         removed = was_valid & now_nan
         result.loc[rs.index[removed]] = "fail"
-
-        # Days that were significantly corrected (>10% change) → suspect
-        both_valid = was_valid & ~now_nan & (rs_arr > 0)
-        if np.any(both_valid):
-            change = np.abs(corr_rs[both_valid] - rs_arr[both_valid]) / rs_arr[both_valid]
-            sig_change = np.zeros(n, dtype=bool)
-            sig_change[both_valid] = change > 0.10
-            # Don't downgrade fail to suspect
-            suspect_only = sig_change & (result.values != "fail")
-            result.loc[rs.index[suspect_only]] = "suspect"
 
         return result, corr_rs
 

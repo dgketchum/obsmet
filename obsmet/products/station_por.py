@@ -7,7 +7,9 @@ and writes one parquet per station.
 from __future__ import annotations
 
 import io
+import json
 import logging
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -21,15 +23,14 @@ from obsmet.qaqc.rules.temporal import (
     MonthlyZScoreRule,
     RHDriftRule,
     RsPeriodRatioRule,
-    StuckSensorRule,
 )
 
 logger = logging.getLogger(__name__)
 
 _STATE_PRECEDENCE = {"fail": 2, "suspect": 1, "pass": 0}
 
-# Variables excluded from z-score (zero-inflated / skewed distributions)
-_ZSCORE_SKIP_VARS = {"prcp"}
+# Variables excluded from z-score (zero-inflated / skewed / event-driven distributions)
+_ZSCORE_SKIP_VARS = {"prcp", "wind"}
 
 # Physical upper bound for daily precipitation (mm) — approx. world record
 _DAILY_PRCP_MAX_MM = 610.0
@@ -62,8 +63,7 @@ def _apply_tier2_qc(
         Rs period-ratio correction.  From RSUN raster or ASCE flat-earth.
     """
     zscore_rule = MonthlyZScoreRule()
-    stuck_rule = StuckSensorRule(min_run_length=5)  # daily threshold
-    td_rule = DewpointTemperatureRule(tolerance=2.0)
+    td_rule = DewpointTemperatureRule(tolerance=3.0)
     rh_drift_rule = RHDriftRule()
     rs_ratio_rule = RsPeriodRatioRule()
 
@@ -81,7 +81,7 @@ def _apply_tier2_qc(
 
         vals = pd.to_numeric(station_df[col], errors="coerce")
 
-        # Monthly z-score (skip zero-inflated variables like precip)
+        # Monthly z-score (skip zero-inflated / skewed variables)
         if col not in _ZSCORE_SKIP_VARS:
             z_states = zscore_rule.check_series(vals, dates)
             for i, (idx, st) in enumerate(z_states.items()):
@@ -90,13 +90,7 @@ def _apply_tier2_qc(
                     tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
                     tier2_reasons[pos].append(f"zscore_{col}")
 
-        # Stuck sensor (all variables)
-        s_states = stuck_rule.check_series(vals)
-        for idx, st in s_states.items():
-            if st != "pass":
-                pos = station_df.index.get_loc(idx)
-                tier2_state.iloc[pos] = _worst_state(tier2_state.iloc[pos], st)
-                tier2_reasons[pos].append(f"stuck_{col}")
+        # TODO: stuck sensor detection belongs in hourly normalize
 
     # Daily precip upper bound
     if "prcp" in station_df.columns:
@@ -196,12 +190,234 @@ def _bucket_id(station_key: str, n_buckets: int = _N_BUCKETS) -> int:
     return hash(station_key) % n_buckets
 
 
+def _safe_station_filename(station_key: str) -> str:
+    """Map a station key to a filesystem-safe parquet stem."""
+    return station_key.replace(":", "_").replace("/", "_")
+
+
+def _build_failure_record(
+    *,
+    source: str,
+    station_key: str,
+    bucket_id: int,
+    exc: Exception,
+) -> dict[str, str | int]:
+    """Capture enough context to debug a failed station without halting the build."""
+    return {
+        "source": source,
+        "phase": "pass2_station",
+        "station_key": station_key,
+        "bucket_id": bucket_id,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "traceback": traceback.format_exc(),
+    }
+
+
+def _build_file_failure_record(
+    *,
+    source: str,
+    input_file: Path,
+    exc: Exception,
+) -> dict[str, str]:
+    """Capture pass-1 file read failures so missing daily chunks are visible."""
+    return {
+        "source": source,
+        "phase": "pass1_read_daily",
+        "input_file": str(input_file),
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "traceback": traceback.format_exc(),
+    }
+
+
+def _build_qc_skip_record(
+    *,
+    source: str,
+    station_key: str,
+    bucket_id: int,
+    qc_name: str,
+    reason: str,
+    details: str = "",
+) -> dict[str, str | int]:
+    """Record successful stations where a QC step was skipped and why."""
+    return {
+        "source": source,
+        "station_key": station_key,
+        "bucket_id": bucket_id,
+        "qc_name": qc_name,
+        "reason": reason,
+        "details": details,
+    }
+
+
+def _resolve_station_rso(
+    grp: pd.DataFrame,
+    station_key: str,
+    *,
+    use_rsun_raster: bool,
+    station_coords: dict[str, tuple[float, float]],
+    rsun_path: str | None,
+) -> tuple[np.ndarray | None, dict[str, str] | None]:
+    """Resolve the clear-sky radiation series used by Rs tier-2 QC."""
+    rsun_error = ""
+    asce_error = ""
+
+    if use_rsun_raster and station_key in station_coords:
+        lon, lat = station_coords[station_key]
+        try:
+            from obsmet.products.rsun import extract_station_rsun
+
+            return extract_station_rsun(lon, lat, str(rsun_path)), None
+        except Exception as exc:
+            rsun_error = f"{type(exc).__name__}: {exc}"
+
+    has_lat = "lat" in grp.columns
+    has_elev = "elev_m" in grp.columns
+    if has_lat and has_elev:
+        lat_val = pd.to_numeric(grp["lat"], errors="coerce").dropna()
+        elev_val = pd.to_numeric(grp["elev_m"], errors="coerce").dropna()
+        if not lat_val.empty and not elev_val.empty:
+            try:
+                from obsmet.products.rsun import compute_rso_asce
+
+                return compute_rso_asce(float(lat_val.iloc[0]), float(elev_val.iloc[0])), None
+            except Exception as exc:
+                asce_error = f"{type(exc).__name__}: {exc}"
+
+    details: list[str] = []
+    if use_rsun_raster:
+        if station_key not in station_coords:
+            details.append("station coords missing from station index")
+        elif rsun_error:
+            details.append(f"RSUN lookup failed: {rsun_error}")
+
+    lat_val = pd.to_numeric(grp["lat"], errors="coerce").dropna() if has_lat else pd.Series()
+    elev_val = pd.to_numeric(grp["elev_m"], errors="coerce").dropna() if has_elev else pd.Series()
+    if not has_lat or not has_elev:
+        missing = []
+        if not has_lat:
+            missing.append("lat")
+        if not has_elev:
+            missing.append("elev_m")
+        details.append(f"missing columns: {', '.join(missing)}")
+    else:
+        if lat_val.empty:
+            details.append("lat contains only null/invalid values")
+        if elev_val.empty:
+            details.append("elev_m contains only null/invalid values")
+        if asce_error:
+            details.append(f"ASCE fallback failed: {asce_error}")
+
+    reason = "rso_unavailable"
+    if use_rsun_raster and rsun_error and asce_error:
+        reason = "rsun_and_asce_failed"
+    elif use_rsun_raster and station_key not in station_coords:
+        reason = "station_index_missing_coords"
+    elif asce_error:
+        reason = "asce_failed"
+    elif not has_lat or not has_elev:
+        reason = "missing_lat_or_elev"
+    elif lat_val.empty:
+        reason = "invalid_lat"
+    elif elev_val.empty:
+        reason = "invalid_elev_m"
+
+    return None, {"reason": reason, "details": "; ".join(details)}
+
+
+def _process_station_group(
+    station_key: str,
+    grp: pd.DataFrame,
+    *,
+    variable_columns: list[str],
+    out_dir: Path,
+    source: str,
+    bucket_id: int,
+    use_rsun_raster: bool,
+    station_coords: dict[str, tuple[float, float]],
+    rsun_path: str | None,
+    min_por_days: int,
+) -> tuple[int | None, dict[str, str | int] | None, dict[str, str | int] | None]:
+    """QC and write one station parquet, returning row count or failure details."""
+    try:
+        grp = grp.sort_values("date").reset_index(drop=True)
+
+        if "date" in grp.columns:
+            grp = grp.drop_duplicates(subset=["date"], keep="first")
+
+        if min_por_days > 0:
+            obs_count = pd.to_numeric(grp.get("obs_count", pd.Series(dtype=float)), errors="coerce")
+            sufficient_days = int((obs_count >= 18).sum())
+            if sufficient_days < min_por_days:
+                return None, None, None
+
+        rso = None
+        rs_qc_skip = None
+        if "rsds" in grp.columns:
+            rso, skip_info = _resolve_station_rso(
+                grp,
+                station_key,
+                use_rsun_raster=use_rsun_raster,
+                station_coords=station_coords,
+                rsun_path=rsun_path,
+            )
+            if rso is None and skip_info is not None:
+                rs_qc_skip = _build_qc_skip_record(
+                    source=source,
+                    station_key=station_key,
+                    bucket_id=bucket_id,
+                    qc_name="rs_period_ratio",
+                    reason=skip_info["reason"],
+                    details=skip_info["details"],
+                )
+        grp = _apply_tier2_qc(grp, variable_columns, rso=rso)
+
+        out_path = out_dir / f"{_safe_station_filename(station_key)}.parquet"
+        grp.to_parquet(out_path, index=False, compression="snappy")
+        return len(grp), None, rs_qc_skip
+    except Exception as exc:
+        return (
+            None,
+            _build_failure_record(
+                source=source,
+                station_key=station_key,
+                bucket_id=bucket_id,
+                exc=exc,
+            ),
+            None,
+        )
+
+
+def _write_failure_report(
+    out_dir: Path,
+    source: str,
+    run_id: str,
+    failures: list[dict[str, str | int]],
+    qc_skips: list[dict[str, str | int]],
+) -> Path:
+    """Write a source-scoped JSON report beside the station_por source directory."""
+    report_path = out_dir.parent / f"station_por_failures_{source}.json"
+    payload = {
+        "source": source,
+        "run_id": run_id,
+        "out_dir": str(out_dir),
+        "failure_count": len(failures),
+        "failures": failures,
+        "qc_skip_count": len(qc_skips),
+        "qc_skips": qc_skips,
+    }
+    with report_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return report_path
+
+
 # ------------------------------------------------------------------ #
 # Pass 1 worker: read one day file, aggregate to daily
 # ------------------------------------------------------------------ #
 
 
-def _aggregate_one_file(args: tuple) -> pd.DataFrame | None:
+def _aggregate_one_file(args: tuple) -> dict[str, object]:
     """Worker: read a normalized parquet, aggregate to daily, return DataFrame."""
     pf_str, prov_dict, start_date, end_date = args
     pf = Path(pf_str)
@@ -211,11 +427,18 @@ def _aggregate_one_file(args: tuple) -> pd.DataFrame | None:
 
     try:
         df = pd.read_parquet(pf)
-    except Exception:
-        return None
+    except Exception as exc:
+        return {
+            "daily": None,
+            "failure": _build_file_failure_record(
+                source=str(prov_dict.get("source", "")),
+                input_file=pf,
+                exc=exc,
+            ),
+        }
 
     if df.empty or "station_key" not in df.columns:
-        return None
+        return {"daily": None, "failure": None}
 
     if "datetime_utc" in df.columns:
         df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
@@ -224,10 +447,10 @@ def _aggregate_one_file(args: tuple) -> pd.DataFrame | None:
         if end_date is not None:
             df = df[df["datetime_utc"].dt.date <= end_date]
         if df.empty:
-            return None
+            return {"daily": None, "failure": None}
 
     daily = aggregate_daily_wide(df, prov)
-    return daily if not daily.empty else None
+    return {"daily": daily if not daily.empty else None, "failure": None}
 
 
 # ------------------------------------------------------------------ #
@@ -235,14 +458,15 @@ def _aggregate_one_file(args: tuple) -> pd.DataFrame | None:
 # ------------------------------------------------------------------ #
 
 
-def _process_bucket(args: tuple) -> dict[str, int]:
+def _process_bucket(args: tuple) -> dict[str, object]:
     """Worker: process all stations in a bucket — QC + write parquets."""
     (
         bucket_df_bytes,
+        bucket_id,
         variable_columns,
         out_dir_str,
         source,
-        run_id,
+        _run_id,
         use_rsun_raster,
         station_coords,
         rsun_path,
@@ -252,51 +476,32 @@ def _process_bucket(args: tuple) -> dict[str, int]:
     out_dir = Path(out_dir_str)
     bucket_df = pd.read_parquet(io.BytesIO(bucket_df_bytes))
     stats: dict[str, int] = {}
+    failures: list[dict[str, str | int]] = []
+    qc_skips: list[dict[str, str | int]] = []
 
     for station_key, grp in bucket_df.groupby("station_key"):
         station_key = str(station_key)
-        grp = grp.sort_values("date").reset_index(drop=True)
+        row_count, failure, rs_qc_skip = _process_station_group(
+            station_key,
+            grp,
+            variable_columns=variable_columns,
+            out_dir=out_dir,
+            source=source,
+            bucket_id=bucket_id,
+            use_rsun_raster=use_rsun_raster,
+            station_coords=station_coords,
+            rsun_path=rsun_path,
+            min_por_days=min_por_days,
+        )
+        if failure is not None:
+            failures.append(failure)
+            continue
+        if rs_qc_skip is not None:
+            qc_skips.append(rs_qc_skip)
+        if row_count is not None:
+            stats[station_key] = row_count
 
-        if "date" in grp.columns:
-            grp = grp.drop_duplicates(subset=["date"], keep="first")
-
-        # Minimum POR filter
-        if min_por_days > 0:
-            obs_count = pd.to_numeric(grp.get("obs_count", pd.Series(dtype=float)), errors="coerce")
-            sufficient_days = int((obs_count >= 18).sum())
-            if sufficient_days < min_por_days:
-                continue
-
-        # Compute Rso for Rs QC
-        rso = None
-        if use_rsun_raster and station_key in station_coords:
-            lon, lat = station_coords[station_key]
-            try:
-                from obsmet.products.rsun import extract_station_rsun
-
-                rso = extract_station_rsun(lon, lat, str(rsun_path))
-            except Exception:
-                pass
-
-        if rso is None and "lat" in grp.columns and "elev_m" in grp.columns:
-            lat_val = pd.to_numeric(grp["lat"], errors="coerce").dropna()
-            elev_val = pd.to_numeric(grp["elev_m"], errors="coerce").dropna()
-            if not lat_val.empty and not elev_val.empty:
-                try:
-                    from obsmet.products.rsun import compute_rso_asce
-
-                    rso = compute_rso_asce(float(lat_val.iloc[0]), float(elev_val.iloc[0]))
-                except Exception:
-                    pass
-
-        grp = _apply_tier2_qc(grp, variable_columns, rso=rso)
-
-        safe_name = station_key.replace(":", "_").replace("/", "_")
-        out_path = out_dir / f"{safe_name}.parquet"
-        grp.to_parquet(out_path, index=False, compression="snappy")
-        stats[station_key] = len(grp)
-
-    return stats
+    return {"stats": stats, "failures": failures, "qc_skips": qc_skips}
 
 
 def build_station_por(
@@ -367,6 +572,8 @@ def build_station_por(
     )
 
     all_daily: list[pd.DataFrame] = []
+    failures: list[dict[str, str | int]] = []
+    qc_skips: list[dict[str, str | int]] = []
 
     if use_parallel:
         task_args = [(str(pf), prov_dict, start_date, end_date) for pf in parquet_files]
@@ -376,20 +583,30 @@ def build_station_por(
             for future in as_completed(futures):
                 done_count += 1
                 result = future.result()
-                if result is not None:
-                    all_daily.append(result)
+                failure = result["failure"]
+                if failure is not None:
+                    failures.append(failure)
+                daily = result["daily"]
+                if daily is not None:
+                    all_daily.append(daily)
                 if done_count % 500 == 0:
                     logger.info("  pass 1: %d/%d files done", done_count, n_files)
     else:
         for i, pf in enumerate(parquet_files):
             result = _aggregate_one_file((str(pf), prov_dict, start_date, end_date))
-            if result is not None:
-                all_daily.append(result)
+            failure = result["failure"]
+            if failure is not None:
+                failures.append(failure)
+            daily = result["daily"]
+            if daily is not None:
+                all_daily.append(daily)
             if (i + 1) % 200 == 0:
                 logger.info("  pass 1: %d/%d files", i + 1, n_files)
 
     if not all_daily:
+        report_path = _write_failure_report(out_dir, source, provenance.run_id, failures, qc_skips)
         logger.warning("No daily data produced from %d files", n_files)
+        logger.warning("Station POR report written to %s", report_path)
         return {}
 
     logger.info("Pass 1 complete: %d files → %d daily chunks", n_files, len(all_daily))
@@ -436,6 +653,7 @@ def build_station_por(
             bucket_tasks.append(
                 (
                     buf.getvalue(),
+                    bid,
                     variable_columns,
                     str(out_dir),
                     source,
@@ -455,14 +673,18 @@ def build_station_por(
             done_count = 0
             for future in as_completed(futures):
                 done_count += 1
-                bucket_stats = future.result()
-                stats.update(bucket_stats)
+                bucket_result = future.result()
+                stats.update(bucket_result["stats"])
+                failures.extend(bucket_result["failures"])
+                qc_skips.extend(bucket_result["qc_skips"])
                 if done_count % 10 == 0:
                     logger.info(
-                        "  pass 2: %d/%d buckets done, %d stations",
+                        "  pass 2: %d/%d buckets done, %d stations, %d failures, %d QC skips",
                         done_count,
                         len(bucket_tasks),
                         len(stats),
+                        len(failures),
+                        len(qc_skips),
                     )
 
         del bucket_tasks
@@ -478,54 +700,35 @@ def build_station_por(
 
             for station_key, grp in bucket_df.groupby("station_key"):
                 station_key = str(station_key)
-                grp = grp.sort_values("date").reset_index(drop=True)
-
-                if "date" in grp.columns:
-                    grp = grp.drop_duplicates(subset=["date"], keep="first")
-
-                if min_por_days > 0:
-                    obs_count = pd.to_numeric(
-                        grp.get("obs_count", pd.Series(dtype=float)), errors="coerce"
-                    )
-                    sufficient_days = int((obs_count >= 18).sum())
-                    if sufficient_days < min_por_days:
-                        continue
-
-                rso = None
-                if use_rsun_raster and station_key in station_coords:
-                    lon, lat = station_coords[station_key]
-                    try:
-                        from obsmet.products.rsun import extract_station_rsun
-
-                        rso = extract_station_rsun(lon, lat, str(rsun_path))
-                    except Exception:
-                        pass
-
-                if rso is None and "lat" in grp.columns and "elev_m" in grp.columns:
-                    lat_val = pd.to_numeric(grp["lat"], errors="coerce").dropna()
-                    elev_val = pd.to_numeric(grp["elev_m"], errors="coerce").dropna()
-                    if not lat_val.empty and not elev_val.empty:
-                        try:
-                            from obsmet.products.rsun import compute_rso_asce
-
-                            rso = compute_rso_asce(float(lat_val.iloc[0]), float(elev_val.iloc[0]))
-                        except Exception:
-                            pass
-
-                grp = _apply_tier2_qc(grp, variable_columns, rso=rso)
-
-                safe_name = station_key.replace(":", "_").replace("/", "_")
-                out_path = out_dir / f"{safe_name}.parquet"
-                grp.to_parquet(out_path, index=False, compression="snappy")
-                manifest.update(station_key, "done", run_id=provenance.run_id)
-                stats[station_key] = len(grp)
+                row_count, failure, rs_qc_skip = _process_station_group(
+                    station_key,
+                    grp,
+                    variable_columns=variable_columns,
+                    out_dir=out_dir,
+                    source=source,
+                    bucket_id=bid,
+                    use_rsun_raster=use_rsun_raster,
+                    station_coords=station_coords,
+                    rsun_path=str(rsun_path) if rsun_path else None,
+                    min_por_days=min_por_days,
+                )
+                if failure is not None:
+                    failures.append(failure)
+                    continue
+                if rs_qc_skip is not None:
+                    qc_skips.append(rs_qc_skip)
+                if row_count is not None:
+                    manifest.update(station_key, "done", run_id=provenance.run_id)
+                    stats[station_key] = row_count
 
             if (bid + 1) % 10 == 0:
                 logger.info(
-                    "  pass 2: %d/%d buckets, %d stations written",
+                    "  pass 2: %d/%d buckets, %d stations written, %d failures, %d QC skips",
                     bid + 1,
                     n_buckets,
                     len(stats),
+                    len(failures),
+                    len(qc_skips),
                 )
 
         manifest.flush()
@@ -539,5 +742,20 @@ def build_station_por(
             manifest.update(sk, "done", run_id=provenance.run_id)
         manifest.flush()
 
-    logger.info("Station POR complete: %d stations", len(stats))
+    report_path = _write_failure_report(out_dir, source, provenance.run_id, failures, qc_skips)
+    if failures:
+        logger.warning(
+            "Station POR complete: %d stations, %d failures, %d QC skips (%s)",
+            len(stats),
+            len(failures),
+            len(qc_skips),
+            report_path,
+        )
+    else:
+        logger.info(
+            "Station POR complete: %d stations, 0 failures, %d QC skips (%s)",
+            len(stats),
+            len(qc_skips),
+            report_path,
+        )
     return stats

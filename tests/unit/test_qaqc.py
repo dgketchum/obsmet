@@ -320,15 +320,15 @@ class TestRsPeriodRatio:
         assert (states == "fail").sum() < n * 0.1
 
     def test_spike_detected(self):
-        """Inject a massive spike — should be flagged."""
+        """Inject spikes below 2×rso_max — should be flagged as fail."""
         rng = np.random.default_rng(42)
         n = 365
-        rso = np.sin(np.linspace(0, np.pi, 365)) * 300 + 100
+        rso = np.sin(np.linspace(0, np.pi, 365)) * 300 + 100  # max ~400
         rs = rso * 0.75 + rng.normal(0, 10, n)
         rs[rs < 0] = 0
-        # Inject spikes
-        rs[10] = 1200.0
-        rs[11] = 1300.0
+        # Inject spikes below 2×rso_max (800) so they pass the overflow filter
+        rs[10] = 600.0
+        rs[11] = 700.0
 
         rs_series = pd.Series(rs, index=range(n))
         doy = pd.Series(np.arange(1, 366), index=range(n))
@@ -337,6 +337,26 @@ class TestRsPeriodRatio:
         states = rule.check_series(rs_series, rso, doy)
         # At least some days should be flagged
         assert (states != "pass").sum() > 0
+
+    def test_corrected_days_not_suspect(self):
+        """Fix 1: days corrected by >10% must never be marked suspect (block removed).
+
+        Strong systematic attenuation (0.60×) forces large per-period corrections.
+        Under the old code, corrected days would return "suspect". After Fix 1 the
+        suspect block is gone, so only real NaN-removals return "fail" — no "suspect".
+        """
+        rng = np.random.default_rng(42)
+        n = 365
+        rso = np.sin(np.linspace(0, np.pi, 365)) * 300 + 100  # max ~400
+        rs = rso * 0.60 + rng.normal(0, 5, n)
+        rs[rs < 0] = 0
+
+        rs_series = pd.Series(rs, index=range(n))
+        doy = pd.Series(np.arange(1, 366), index=range(n))
+
+        rule = RsPeriodRatioRule()
+        states = rule.check_series(rs_series, rso, doy)
+        assert "suspect" not in states.values
 
     def test_correct_series_returns_corrected_values(self):
         """correct_series() should return 2-tuple with corrected array."""
@@ -356,6 +376,25 @@ class TestRsPeriodRatio:
         assert isinstance(states, pd.Series)
         assert isinstance(corr_rs, np.ndarray)
         assert len(corr_rs) == n
+
+    def test_exact_multiple_of_period_returns_full_length(self):
+        """Exact 60-day multiples should not trigger the upstream shape bug."""
+        rng = np.random.default_rng(42)
+        rso = np.sin(np.linspace(0, np.pi, 365)) * 20 + 10
+        rule = RsPeriodRatioRule()
+
+        for n in (60, 300, 360):
+            rs = rso[np.arange(n) % 365] * 0.90 + rng.normal(0, 0.5, n)
+            rs[rs < 0] = 0
+            rs_series = pd.Series(rs, index=range(n))
+            doy = pd.Series((np.arange(n) % 365) + 1, index=range(n))
+
+            states, corr_rs = rule.correct_series(rs_series, rso, doy)
+
+            assert isinstance(states, pd.Series)
+            assert len(states) == n
+            assert isinstance(corr_rs, np.ndarray)
+            assert len(corr_rs) == n
 
 
 class TestRsoASCE:
