@@ -33,9 +33,10 @@ RS_CONV = 86400 / 1e6  # = 0.0864
 
 # Map our qc_reason_codes to the agweather variable(s) they govern
 RULE_TO_AGW_VARS: dict[str, list[str]] = {
-    "zscore_tmax": ["tmax"],
-    "zscore_tmin": ["tmin"],
-    "zscore_tmean": ["tmean"],
+    # zscore_tmax/tmin/tmean omitted — we call agweather's own modified_z_score_outlier_detection
+    # directly, so the algorithm is identical. Disagreement is driven by agweather's manual
+    # correction intervals (sensor failure periods) layered on top of their z-score, not by
+    # algorithmic differences. Comparison against their final output is not meaningful.
     "zscore_td": ["td"],
     "zscore_rh": ["rh", "rhmax", "rhmin"],
     "zscore_prcp": ["prcp"],
