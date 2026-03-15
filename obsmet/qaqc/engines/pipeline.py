@@ -6,7 +6,6 @@ Stores both machine-decision outputs and original native flags.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -65,7 +64,7 @@ QC_PROFILES: dict[str, dict] = {
 # --------------------------------------------------------------------------- #
 
 _VARIABLE_COLUMNS: dict[str, list[str]] = {
-    "madis": ["tair", "td", "rh", "wind", "wind_dir", "prcp", "rsds_hourly"],
+    "madis": ["tmax", "tmin", "tmean", "td", "rh", "wind", "wind_dir", "prcp", "rsds"],
     "isd": ["tair", "td", "wind", "wind_dir", "slp", "prcp"],
     "ghcnh": ["tair", "td", "wind", "wind_dir", "slp", "psfc", "prcp", "rh"],
     "ghcnd": ["tmax", "tmin", "tmean", "prcp", "snow", "snow_depth", "wind", "swe"],
@@ -82,6 +81,17 @@ _MADIS_VAR_REVERSE: dict[str, str] = {
     "rh": "relHumidity",
     "wind": "windSpeed",
     "wind_dir": "windDir",
+}
+
+_GDAS_QM_COLUMNS: dict[str, str] = {
+    "tair": "tair_qm",
+    "td": "td_qm",
+    "wind": "wind_qm",
+    "wind_dir": "wind_qm",
+    "psfc": "psfc_qm",
+    "q": "q_qm",
+    "u": "u_qm",
+    "v": "v_qm",
 }
 
 
@@ -105,6 +115,11 @@ def build_default_pipeline(source: str, **kwargs) -> QCPipeline:
             pipeline.add_rule(MadisQCRRule(reject_mask=qcr_mask))
         else:
             pipeline.add_rule(MadisQCRRule())
+
+    if source == "gdas":
+        from obsmet.qaqc.rules.gdas import GdasQualityMarkerRule
+
+        pipeline.add_rule(GdasQualityMarkerRule())
 
     pipeline.add_rule(PhysicalBoundsRule())
     pipeline.add_rule(DewpointConsistencyRule())
@@ -131,6 +146,7 @@ def apply_pipeline_to_df(
     Aggregates across all variables per row: worst state wins.
     """
     is_madis = source == "madis"
+    is_gdas = source == "gdas"
 
     qc_states = []
     qc_reasons = []
@@ -140,7 +156,7 @@ def apply_pipeline_to_df(
 
         for col in variable_columns:
             val = getattr(row, col, None)
-            if val is None or (isinstance(val, float) and math.isnan(val)):
+            if val is None or pd.isna(val):
                 continue
 
             ctx: dict = {"variable": col}
@@ -152,22 +168,23 @@ def apply_pipeline_to_df(
                     dd_col = f"{native}DD"
                     qcr_col = f"{native}QCR"
                     dd_val = getattr(row, dd_col, None)
-                    if dd_val is not None and not (
-                        isinstance(dd_val, float) and math.isnan(dd_val)
-                    ):
+                    if dd_val is not None and not pd.isna(dd_val):
                         ctx["dd_flag"] = str(dd_val)
                     qcr_val = getattr(row, qcr_col, None)
-                    if qcr_val is not None and not (
-                        isinstance(qcr_val, float) and math.isnan(qcr_val)
-                    ):
+                    if qcr_val is not None and not pd.isna(qcr_val):
                         ctx["qcr_value"] = int(qcr_val)
+
+            if is_gdas:
+                qm_col = _GDAS_QM_COLUMNS.get(col)
+                if qm_col:
+                    qm_val = getattr(row, qm_col, None)
+                    if qm_val is not None and not pd.isna(qm_val):
+                        ctx["qm"] = int(qm_val)
 
             # Dewpoint check needs tair context
             if col == "td":
                 tair_val = getattr(row, "tair", None)
-                if tair_val is not None and not (
-                    isinstance(tair_val, float) and math.isnan(tair_val)
-                ):
+                if tair_val is not None and not pd.isna(tair_val):
                     ctx["tair"] = tair_val
 
             results = pipeline.run(float(val), **ctx)
