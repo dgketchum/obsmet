@@ -5,6 +5,8 @@ All commands support --start, --end, --resume, --workers, --overwrite, --dry-run
 
 from __future__ import annotations
 
+import logging
+
 import click
 
 
@@ -23,6 +25,11 @@ def common_options(fn):
 @click.version_option(version="0.1.0")
 def cli():
     """obsmet — unified meteorological observation pipeline."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -41,7 +48,7 @@ _DEFAULT_RAW_DIRS = {
 }
 
 _DEFAULT_NORM_DIRS = {
-    "madis": "/mnt/mco_nas1/shared/obsmet/normalized/madis",
+    "madis": "/mnt/mco_nas1/shared/obsmet/normalized/madis/permissive",
     "isd": "/mnt/mco_nas1/shared/obsmet/normalized/isd",
     "ghcnh": "/mnt/mco_nas1/shared/obsmet/normalized/ghcnh",
     "ghcnd": "/mnt/mco_nas1/shared/obsmet/normalized/ghcnd",
@@ -334,6 +341,197 @@ def normalize(
     )
 
 
+def _run_gdas_extract_raw(
+    start,
+    end,
+    raw_dir,
+    out_dir,
+    product,
+    resume,
+    workers,
+    overwrite,
+    dry_run,
+):
+    """Run the GDAS raw re-extract workflow."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from functools import partial
+    from pathlib import Path
+
+    from obsmet.core.manifest import Manifest
+    from obsmet.core.provenance import generate_run_id
+    from obsmet.sources.gdas_prepbufr.download import DEFAULT_RAW_DIR
+    from obsmet.sources.gdas_prepbufr.reextract import (
+        discover_cycle_keys,
+        extract_cycle_to_partitions,
+    )
+
+    raw_dir = Path(raw_dir) if raw_dir else Path(DEFAULT_RAW_DIR)
+    out_dir = Path(out_dir) if out_dir else raw_dir
+
+    if start is None or end is None:
+        click.echo("Error: --start and --end are required for gdas raw extract.")
+        return
+
+    run_id = generate_run_id()
+    surface_manifest = Manifest(
+        out_dir / "surface" / "manifest.parquet", source="gdas_extract_surface"
+    )
+    events_manifest = Manifest(
+        out_dir / "events" / "manifest.parquet", source="gdas_extract_events"
+    )
+
+    all_keys = discover_cycle_keys(start.date(), end.date())
+    tasks: list[tuple[str, bool, bool]] = []
+    for key in all_keys:
+        want_surface = product in ("surface", "both")
+        want_events = product in ("events", "both")
+        if resume and not overwrite:
+            if want_surface and surface_manifest.get_state(key) == "done":
+                want_surface = False
+            if want_events and events_manifest.get_state(key) == "done":
+                want_events = False
+        if want_surface or want_events:
+            tasks.append((key, want_surface, want_events))
+
+    click.echo(
+        f"GDAS raw extract: {len(tasks)} cycle keys, product={product}, workers={workers} → {out_dir}"
+    )
+
+    if dry_run:
+        for key, want_surface, want_events in tasks[:10]:
+            outputs = []
+            if want_surface:
+                outputs.append("surface")
+            if want_events:
+                outputs.append("events")
+            click.echo(f"  would extract: {key} ({'+'.join(outputs)})")
+        if len(tasks) > 10:
+            click.echo(f"  ... and {len(tasks) - 10} more")
+        return
+
+    worker = partial(
+        extract_cycle_to_partitions,
+        raw_dir=raw_dir,
+        out_dir=out_dir,
+        overwrite=overwrite,
+    )
+
+    done = 0
+    surface_done = 0
+    events_done = 0
+    errors = 0
+    use_parallel = workers > 1
+
+    def _apply_result(result):
+        nonlocal done, surface_done, events_done, errors
+        key = str(result["key"])
+        surface_state = result.get("surface_state")
+        events_state = result.get("events_state")
+        message = str(result.get("message", ""))
+
+        if surface_state is not None:
+            surface_manifest.update(key, surface_state, run_id=run_id, message=message)
+            if surface_state == "done":
+                surface_done += 1
+            elif surface_state in {"failed", "missing"}:
+                errors += 1
+
+        if events_state is not None:
+            events_manifest.update(key, events_state, run_id=run_id, message=message)
+            if events_state == "done":
+                events_done += 1
+            elif events_state in {"failed", "missing"}:
+                errors += 1
+
+        done += 1
+        if done % 25 == 0:
+            click.echo(
+                f"  progress: {done}/{len(tasks)} cycles, "
+                f"surface_done={surface_done}, events_done={events_done}, errors={errors}"
+            )
+            surface_manifest.flush()
+            events_manifest.flush()
+
+    if use_parallel:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    worker,
+                    key,
+                    write_surface=want_surface,
+                    write_events=want_events,
+                ): (key, want_surface, want_events)
+                for key, want_surface, want_events in tasks
+            }
+            for future in as_completed(futures):
+                key, want_surface, want_events = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    if want_surface:
+                        surface_manifest.update(key, "failed", run_id=run_id, message=str(exc))
+                    if want_events:
+                        events_manifest.update(key, "failed", run_id=run_id, message=str(exc))
+                    done += 1
+                    errors += int(want_surface) + int(want_events)
+                    continue
+                _apply_result(result)
+    else:
+        for key, want_surface, want_events in tasks:
+            try:
+                result = worker(
+                    key,
+                    write_surface=want_surface,
+                    write_events=want_events,
+                )
+            except Exception as exc:
+                if want_surface:
+                    surface_manifest.update(key, "failed", run_id=run_id, message=str(exc))
+                if want_events:
+                    events_manifest.update(key, "failed", run_id=run_id, message=str(exc))
+                done += 1
+                errors += int(want_surface) + int(want_events)
+                continue
+            _apply_result(result)
+
+    surface_manifest.flush()
+    events_manifest.flush()
+    click.echo(
+        f"GDAS raw extract done: cycles={done}, surface_done={surface_done}, "
+        f"events_done={events_done}, errors={errors}"
+    )
+
+
+@cli.command("extract-raw")
+@click.argument("source")
+@click.option("--raw-dir", default=None, help="Override raw data directory")
+@click.option("--out-dir", default=None, help="Override output directory")
+@click.option(
+    "--product",
+    type=click.Choice(["surface", "events", "both"]),
+    default="both",
+    help="Which raw extract products to write",
+)
+@common_options
+def extract_raw(source, raw_dir, out_dir, product, start, end, resume, workers, overwrite, dry_run):
+    """Extract raw partitioned products for SOURCE."""
+    if source != "gdas":
+        click.echo(f"Source {source!r} not yet implemented for raw extract.")
+        return
+
+    _run_gdas_extract_raw(
+        start=start,
+        end=end,
+        raw_dir=raw_dir,
+        out_dir=out_dir,
+        product=product,
+        resume=resume,
+        workers=workers,
+        overwrite=overwrite,
+        dry_run=dry_run,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # QAQC, Build, Crosswalk, Corrections, Diagnostics
 # --------------------------------------------------------------------------- #
@@ -348,7 +546,10 @@ def qaqc(source, start, end, resume, workers, overwrite, dry_run):
 
 
 @cli.command()
-@click.argument("product", type=click.Choice(["hourly", "daily", "station-por", "fabric"]))
+@click.argument(
+    "product",
+    type=click.Choice(["hourly", "daily", "station-por", "station-por-inventory", "fabric"]),
+)
 @click.option(
     "--source",
     default="all",
@@ -409,6 +610,14 @@ def build(
             station_index_path=station_index_path,
             rsun_path=rsun_path,
             min_por_days=min_por_days,
+        )
+    elif product == "station-por-inventory":
+        _build_station_por_inventory_inventory(
+            source,
+            out_dir=out_dir,
+            workers=workers,
+            overwrite=overwrite,
+            dry_run=dry_run,
         )
     elif product == "fabric":
         _build_fabric(
@@ -1220,7 +1429,10 @@ def _build_station_por(
 
     for src in sources:
         norm_dir = Path(_DEFAULT_NORM_DIRS.get(src, f"/nas/climate/obsmet/normalized/{src}"))
-        out_dir = Path(f"/mnt/mco_nas1/shared/obsmet/products/station_por/{src}")
+        # If norm_dir is a profile subdir (e.g. .../madis/permissive), mirror that in output
+        profile = norm_dir.name if norm_dir.name in ("permissive", "strict") else None
+        por_base = Path(f"/mnt/mco_nas1/shared/obsmet/products/station_por/{src}")
+        out_dir = por_base / profile if profile else por_base
 
         if dry_run:
             click.echo(f"  {src}: would build station POR from {norm_dir} → {out_dir}")
@@ -1319,6 +1531,50 @@ def _build_daily(source, start, end, resume, workers, overwrite, dry_run):
                 write_daily(daily_df, out_path)
 
     click.echo("Build daily done.")
+
+
+def _build_station_por_inventory_inventory(
+    source: str,
+    *,
+    out_dir: str | None,
+    workers: int,
+    overwrite: bool,
+    dry_run: bool,
+):
+    """Build station POR inventory exports for completed source products."""
+    from pathlib import Path
+
+    from obsmet.products.station_por_inventory import (
+        DEFAULT_STATION_POR_BASE,
+        DEFAULT_STATION_POR_INVENTORY_DIR,
+        build_station_por_inventory,
+    )
+
+    por_base = Path(DEFAULT_STATION_POR_BASE)
+    inventory_dir = Path(out_dir) if out_dir else Path(DEFAULT_STATION_POR_INVENTORY_DIR)
+
+    available_sources = sorted(path.name for path in por_base.iterdir() if path.is_dir())
+    sources = available_sources if source == "all" else [source]
+
+    if dry_run:
+        click.echo(
+            f"Build station-por-inventory: sources={sources}, workers={workers} → {inventory_dir}"
+        )
+        return
+
+    if overwrite and inventory_dir.exists():
+        for existing in inventory_dir.glob("station_por_inventory_*"):
+            if existing.is_file():
+                existing.unlink()
+
+    outputs = build_station_por_inventory(
+        por_base=por_base,
+        sources=sources,
+        out_dir=inventory_dir,
+        workers=workers,
+    )
+    built_sources = [src for src in outputs if src != "all"]
+    click.echo(f"Station POR inventory done: sources={built_sources}, out_dir={inventory_dir}")
 
 
 # --------------------------------------------------------------------------- #

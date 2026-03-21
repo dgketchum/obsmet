@@ -25,6 +25,7 @@ _PER_DAY_SOURCES = {"madis", "gdas"}
 _TEMPORAL_RES = {
     "ghcnd": "daily",
     "ghcnh": "hourly",
+    "isd": "hourly",
     "snotel": "daily",
     "ndbc": "hourly",
     "raws_wrcc": "daily",
@@ -224,6 +225,10 @@ def build_station_index(
         if not norm_dir.exists():
             logger.info("Skipping %s: directory not found", source)
             continue
+
+        # For sources with profile subdirs (e.g. madis/permissive), prefer permissive
+        if (norm_dir / "permissive").exists():
+            norm_dir = norm_dir / "permissive"
 
         logger.info("Indexing %s ...", source)
 
