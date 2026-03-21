@@ -182,7 +182,7 @@ DAILY_SOURCES = ["madis", "ghcnh", "gdas", "ndbc"]
 REQUIRED_HOURS_BY_SOURCE = {
     "madis": 18,
     "ghcnh": 4,  # SYNOP stations report as few as 4 obs/day (00,06,12,18 UTC)
-    "gdas": 18,
+    "gdas": 4,  # ADPSFC includes SYNOP stations (00,06,12,18 UTC = 4 distinct hours)
     "ndbc": 18,
 }
 
