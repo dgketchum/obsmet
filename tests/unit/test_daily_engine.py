@@ -9,6 +9,7 @@ from obsmet.core.time_policy import (
     DAILY_AGG_MAP,
     DAILY_SOURCES,
     aggregate_daily_wide,
+    required_hours_for_source,
 )
 
 
@@ -40,8 +41,14 @@ class TestAggregateConstants:
         assert "tair" in DAILY_AGG_MAP
         assert "prcp" in DAILY_AGG_MAP
         assert "wind_dir" in DAILY_AGG_MAP
+        assert "psfc" in DAILY_AGG_MAP
         assert DAILY_AGG_MAP["prcp"] == "sum"
         assert DAILY_AGG_MAP["wind_dir"] == "circular_mean"
+
+    def test_required_hours_for_source(self):
+        assert required_hours_for_source("gdas") == 18
+        assert required_hours_for_source("madis") == 18
+        assert required_hours_for_source("unknown") == 18
 
 
 class TestAggregateDailyWide:
@@ -66,6 +73,32 @@ class TestAggregateDailyWide:
         df = _make_hourly("test:001", "2024-01-15", prcp=prcp_vals)
         result = aggregate_daily_wide(df, provenance)
         assert result.loc[0, "prcp"] == pytest.approx(24.0)
+
+    def test_prcp_madis_accumulation(self):
+        """MADIS precipAccum: running total → sum positive diffs only."""
+        madis_prov = RunProvenance(source="madis", command="test", run_id="test456")
+        # Simulate precipAccum: starts at 5.84, rises to 8.38 with one reset
+        # (accumulation stuck at same value for many minutes, then increments)
+        accum = [5.84] * 6 + [6.10] * 6 + [6.35] * 6 + [6.35] * 6
+        df = _make_hourly("madis:EPZ02", "2024-01-15", n_hours=24, prcp=accum)
+        result = aggregate_daily_wide(df, madis_prov)
+        # Correct daily total: 6.35 - 5.84 = 0.51 mm (the net increment)
+        assert result.loc[0, "prcp"] == pytest.approx(0.51, abs=0.01)
+
+    def test_prcp_madis_with_reset(self):
+        """MADIS precipAccum: mid-day reset handled by diff+sum."""
+        madis_prov = RunProvenance(source="madis", command="test", run_id="test789")
+        # Accumulates to 5mm, resets to 0, then accumulates to 3mm
+        accum = list(range(0, 6)) + [0, 1, 2, 3] + [3] * 14  # total increment: 5+3=8
+        df = _make_hourly("madis:TEST", "2024-01-15", n_hours=24, prcp=[float(v) for v in accum])
+        result = aggregate_daily_wide(df, madis_prov)
+        assert result.loc[0, "prcp"] == pytest.approx(8.0, abs=0.01)
+
+    def test_psfc_mean(self, provenance):
+        psfc_vals = [100000.0, 100200.0] * 12
+        df = _make_hourly("test:001", "2024-01-15", psfc=psfc_vals)
+        result = aggregate_daily_wide(df, provenance)
+        assert result.loc[0, "psfc"] == pytest.approx(100100.0)
 
     def test_wind_dir_circular(self, provenance):
         wind_dirs = [350.0, 10.0, 355.0, 5.0] + [0.0] * 20
@@ -118,6 +151,14 @@ class TestAggregateDailyWide:
         assert result.loc[0, "qc_rules_version"] == provenance.qaqc_rules_version
         assert result.loc[0, "transform_version"] == provenance.transform_version
         assert result.loc[0, "ingest_run_id"] == "test123"
+
+    def test_hourly_suspect_propagates_to_daily_qc(self, provenance):
+        df = _make_hourly("test:001", "2024-01-15", tair=10.0)
+        df["qc_state"] = ["pass"] * 23 + ["suspect"]
+        df["qc_reason_codes"] = [""] * 23 + ["qm9_missing_obs_error"]
+        result = aggregate_daily_wide(df, provenance)
+        assert result.loc[0, "qc_state"] == "suspect"
+        assert "qm9_missing_obs_error" in result.loc[0, "qc_reason_codes"]
 
     def test_coverage_flags(self, provenance):
         df = _make_hourly("test:001", "2024-01-15", n_hours=24, tair=10.0)

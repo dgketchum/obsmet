@@ -66,9 +66,9 @@ QC_PROFILES: dict[str, dict] = {
 _VARIABLE_COLUMNS: dict[str, list[str]] = {
     "madis": ["tmax", "tmin", "tmean", "td", "rh", "wind", "wind_dir", "prcp", "rsds"],
     "isd": ["tair", "td", "wind", "wind_dir", "slp", "prcp"],
-    "ghcnh": ["tair", "td", "wind", "wind_dir", "slp", "psfc", "prcp", "rh"],
+    "ghcnh": ["tmax", "tmin", "tmean", "td", "wind", "wind_dir", "slp", "psfc", "prcp", "rh"],
     "ghcnd": ["tmax", "tmin", "tmean", "prcp", "snow", "snow_depth", "wind", "swe"],
-    "gdas": ["tair", "td", "wind", "wind_dir", "psfc"],
+    "gdas": ["tair", "td", "wind", "wind_dir", "psfc", "prcp"],
     "raws": ["tmean", "tmax", "tmin", "wind", "wind_dir", "rh", "prcp", "rsds"],
     "ndbc": ["tair", "td", "wind", "wind_dir", "slp"],
     "snotel": ["tmax", "tmin", "tmean", "prcp", "swe", "rh", "wind"],

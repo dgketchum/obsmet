@@ -39,6 +39,36 @@ def assign_utc_date(datetime_utc: pd.Series) -> pd.Series:
     return datetime_utc.dt.date
 
 
+def _aggregate_qc_state(states: pd.Series) -> str:
+    """Aggregate hourly QC state to a daily state."""
+    valid = states.dropna().astype(str)
+    if valid.empty:
+        return "pass"
+    if (valid == "fail").any():
+        return "fail"
+    if (valid == "suspect").any():
+        return "suspect"
+    return "pass"
+
+
+def _aggregate_qc_reasons(reasons: pd.Series) -> str:
+    """Aggregate hourly QC reasons to a unique comma-separated daily list."""
+    if reasons.empty:
+        return ""
+    unique: list[str] = []
+    seen: set[str] = set()
+    for raw in reasons.dropna().astype(str):
+        if not raw:
+            continue
+        for part in raw.split(","):
+            part = part.strip()
+            if not part or part in seen:
+                continue
+            seen.add(part)
+            unique.append(part)
+    return ",".join(unique)
+
+
 def hourly_coverage(
     datetime_utc: pd.Series,
     date: dt.date,
@@ -147,6 +177,15 @@ def circular_mean_deg(angles: pd.Series) -> float:
 # Sources that support hourly → daily aggregation
 DAILY_SOURCES = ["madis", "ghcnh", "gdas", "ndbc"]
 
+# Source-specific daily coverage thresholds. GDAS currently keeps the same
+# 18-hour requirement as MADIS, but making it explicit avoids hidden defaults.
+REQUIRED_HOURS_BY_SOURCE = {
+    "madis": 18,
+    "ghcnh": 4,  # SYNOP stations report as few as 4 obs/day (00,06,12,18 UTC)
+    "gdas": 18,
+    "ndbc": 18,
+}
+
 # Variables and their aggregation method for daily rollup from hourly data
 DAILY_AGG_MAP = {
     "tair": "mean",
@@ -155,8 +194,14 @@ DAILY_AGG_MAP = {
     "wind": "mean",
     "wind_dir": "circular_mean",
     "slp": "mean",
+    "psfc": "mean",
     "prcp": "sum",
 }
+
+
+def required_hours_for_source(source: str) -> int:
+    """Return the configured daily coverage threshold for a source."""
+    return REQUIRED_HOURS_BY_SOURCE.get(source, 18)
 
 
 def aggregate_daily_wide(
@@ -164,6 +209,7 @@ def aggregate_daily_wide(
     provenance: RunProvenance,
     *,
     agg_map: dict[str, str] | None = None,
+    required_hours: int | None = None,
 ) -> pd.DataFrame:
     """Aggregate wide-form hourly observations to daily records.
 
@@ -179,6 +225,8 @@ def aggregate_daily_wide(
     """
     if agg_map is None:
         agg_map = DAILY_AGG_MAP
+    if required_hours is None:
+        required_hours = required_hours_for_source(provenance.source)
 
     if df.empty or "datetime_utc" not in df.columns:
         return pd.DataFrame()
@@ -194,7 +242,7 @@ def aggregate_daily_wide(
 
     daily_records = []
     for (stn, day), grp in groups:
-        cov = hourly_coverage(grp["datetime_utc"], day)
+        cov = hourly_coverage(grp["datetime_utc"], day, required_hours=required_hours)
         cov_str = (
             f"n={cov['obs_count']}"
             f",thresh={'Y' if cov['meets_threshold'] else 'N'}"
@@ -208,11 +256,15 @@ def aggregate_daily_wide(
             "day_basis": "utc",
             "obs_count": len(grp),
             "coverage_flags": cov_str,
-            "qc_state": "pass",
+            "qc_state": _aggregate_qc_state(grp["qc_state"])
+            if "qc_state" in grp.columns
+            else "pass",
             "qc_rules_version": provenance.qaqc_rules_version,
             "transform_version": provenance.transform_version,
             "ingest_run_id": provenance.run_id,
         }
+        if "qc_reason_codes" in grp.columns:
+            rec["qc_reason_codes"] = _aggregate_qc_reasons(grp["qc_reason_codes"])
 
         for var, agg_type in agg_map.items():
             if var not in grp.columns:
@@ -223,7 +275,15 @@ def aggregate_daily_wide(
             if agg_type == "mean":
                 rec[var] = float(vals.mean())
             elif agg_type == "sum":
-                rec[var] = float(vals.sum())
+                if var == "prcp" and provenance.source == "madis":
+                    # MADIS prcp is precipAccum (running total since instrument reset).
+                    # Sum positive increments (first-differences) to get true daily total.
+                    ordered = grp.sort_values("datetime_utc")
+                    pv = pd.to_numeric(ordered[var], errors="coerce").dropna()
+                    diffs = pv.diff().fillna(0)
+                    rec[var] = float(diffs[diffs > 0].sum())
+                else:
+                    rec[var] = float(vals.sum())
             elif agg_type == "circular_mean":
                 rec[var] = circular_mean_deg(vals)
 
