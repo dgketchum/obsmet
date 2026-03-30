@@ -8,6 +8,20 @@ and hourly values. No authentication required.
 
 Station triplet format: {stationId}:{stateCode}:SNTL (e.g., 562:MT:SNTL)
 
+Timezone convention
+-------------------
+ALL SNOTEL timestamps are in **Pacific Standard Time (PST = UTC-8)** year-round,
+regardless of the station's physical location. Alaska stations use AKST (UTC-9).
+There is no DST adjustment — PST/AKST is used even in summer months.
+
+The AWDB ``dataTimeZone`` field confirms this: -8.0 for all lower-48 states,
+-9.0 for Alaska. This is a longstanding NRCS convention (NWCC HQ is in Portland, OR).
+
+Consequence: a Colorado station reporting ``2024-01-15 00:00`` means midnight PST,
+which is 08:00 UTC and 01:00 MST. The ``_convert_to_utc`` function uses the
+``dataTimeZone`` offset directly, which is correct because it represents the
+**data** timezone (PST/AKST), not the station's physical timezone.
+
 Note: AWDB station IDs differ from the IDs used in the legacy daily CSV files
 (snotel_records/). The station inventory maps AWDB IDs to names/coordinates.
 """
@@ -36,6 +50,25 @@ _UNIT_CONVERT = {
     "degF_to_degC": lambda f: (f - 32.0) * 5.0 / 9.0,
 }
 
+# Physical timezone by state (IANA names) for downstream local-day aggregation.
+# SNOTEL data timestamps use PST/AKST, but the station's physical timezone
+# matters for understanding when "midnight" actually occurs at the site.
+_STATE_TIMEZONE = {
+    "AK": "US/Alaska",
+    "AZ": "US/Arizona",  # no DST
+    "CA": "US/Pacific",
+    "CO": "US/Mountain",
+    "ID": "US/Mountain",
+    "MT": "US/Mountain",
+    "NM": "US/Mountain",
+    "NV": "US/Pacific",
+    "OR": "US/Pacific",
+    "SD": "US/Mountain",
+    "UT": "US/Mountain",
+    "WA": "US/Pacific",
+    "WY": "US/Mountain",
+}
+
 
 def fetch_station_inventory(
     *,
@@ -46,7 +79,10 @@ def fetch_station_inventory(
 
     Returns DataFrame with columns:
         station_triplet, station_id, state, name, lat, lon, elev_ft,
-        tz_offset, begin_date, end_date
+        tz_offset, physical_tz, begin_date, end_date
+
+    tz_offset is the AWDB dataTimeZone (PST=-8 or AKST=-9, the DATA timezone).
+    physical_tz is the IANA timezone for the station's physical location.
     """
     url = f"{AWDB_BASE}/stations"
     params = {
@@ -66,16 +102,18 @@ def fetch_station_inventory(
     for s in raw:
         if s.get("networkCode") != network:
             continue
+        state = s.get("stateCode", "")
         records.append(
             {
                 "station_triplet": s.get("stationTriplet"),
                 "station_id": s.get("stationId"),
-                "state": s.get("stateCode"),
+                "state": state,
                 "name": s.get("name"),
                 "lat": s.get("latitude"),
                 "lon": s.get("longitude"),
                 "elev_ft": s.get("elevation"),
                 "tz_offset": s.get("dataTimeZone"),
+                "physical_tz": _STATE_TIMEZONE.get(state, ""),
                 "begin_date": s.get("beginDate"),
                 "end_date": s.get("endDate"),
             }
@@ -257,14 +295,14 @@ def download_snotel_hourly(
     if elements is None:
         elements = DEFAULT_ELEMENTS
 
-    # Build station list
+    # Build station list — include inactive stations for full POR coverage
     if station_triplets is not None:
         # Use provided triplets; still need metadata for timezone
-        inventory = fetch_station_inventory()
+        inventory = fetch_station_inventory(active_only=False)
         inv_lookup = {row["station_triplet"]: row for _, row in inventory.iterrows()}
         triplets = station_triplets
     else:
-        inventory = fetch_station_inventory()
+        inventory = fetch_station_inventory(active_only=False)
         if states:
             inventory = inventory[inventory["state"].isin(states)]
         inv_lookup = {row["station_triplet"]: row for _, row in inventory.iterrows()}
@@ -330,6 +368,7 @@ def download_snotel_hourly(
         df["lat"] = meta.get("lat")
         df["lon"] = meta.get("lon")
         df["elev_ft"] = meta.get("elev_ft")
+        df["physical_tz"] = meta.get("physical_tz", "")
 
         df.to_parquet(out_path, index=False, compression="snappy")
         stats[triplet] = len(df)
