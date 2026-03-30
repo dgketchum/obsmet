@@ -46,8 +46,10 @@ class TestAggregateConstants:
         assert DAILY_AGG_MAP["wind_dir"] == "circular_mean"
 
     def test_required_hours_for_source(self):
-        assert required_hours_for_source("gdas") == 18
+        assert required_hours_for_source("gdas") == 4
         assert required_hours_for_source("madis") == 18
+        assert required_hours_for_source("raws") == 1
+        assert required_hours_for_source("snotel") == 1
         assert required_hours_for_source("unknown") == 18
 
 

@@ -9,7 +9,9 @@ from __future__ import annotations
 import io
 import json
 import logging
+import shutil
 import traceback
+from datetime import date as _date
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +19,7 @@ import pandas as pd
 
 from obsmet.core.manifest import Manifest
 from obsmet.core.provenance import RunProvenance
-from obsmet.core.time_policy import aggregate_daily_wide
+from obsmet.core.time_policy import aggregate_daily_wide, required_hours_for_source
 from obsmet.qaqc.rules.temporal import (
     MonthlyZScoreRule,
     RHDriftRule,
@@ -28,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 _STATE_PRECEDENCE = {"fail": 2, "suspect": 1, "pass": 0}
 
-# Variables excluded from z-score (zero-inflated / skewed / event-driven distributions)
-_ZSCORE_SKIP_VARS = {"prcp", "wind", "tair"}  # tair is redundant with tmean
+# Variables excluded from z-score (zero-inflated / skewed / circular / redundant)
+_ZSCORE_SKIP_VARS = {"prcp", "wind", "wind_dir", "tair"}  # tair is redundant with tmean
 
 # Physical upper bound for daily precipitation (mm) — approx. world record
 _DAILY_PRCP_MAX_MM = 610.0
@@ -157,6 +159,10 @@ def _apply_tier2_qc(
 
 
 _N_BUCKETS = 100
+_GDAS_STAGE_DIRNAME = "_gdas_hourly_stage"
+_STATION_POR_VARIABLE_COLUMNS: dict[str, list[str]] = {
+    "gdas": ["tmean", "td", "psfc"],
+}
 
 
 def _bucket_id(station_key: str, n_buckets: int = _N_BUCKETS) -> int:
@@ -223,6 +229,53 @@ def _build_qc_skip_record(
         "reason": reason,
         "details": details,
     }
+
+
+def _station_por_variable_columns(source: str, default_columns: list[str]) -> list[str]:
+    """Return source-specific Tier 2 variable targets for station POR."""
+    return _STATION_POR_VARIABLE_COLUMNS.get(source, default_columns)
+
+
+def _drop_failed_hourly_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Exclude hourly rows already failed by source-native/physical QC."""
+    if df.empty or "qc_state" not in df.columns:
+        return df
+    states = df["qc_state"].fillna("pass")
+    return df.loc[states != "fail"].copy()
+
+
+def _prepare_gdas_hourly(df: pd.DataFrame) -> pd.DataFrame:
+    """Prepare GDAS hourly rows for daily aggregation.
+
+    Derives Tier-2 input columns if missing and collapses duplicate
+    station/timestamp rows so coverage reflects unique observations rather than
+    variable bundles or repeated cycle snapshots.
+    """
+    from obsmet.sources.gdas_prepbufr.adapter import (
+        _collapse_duplicate_timestamps,
+        _dewpoint_from_specific_humidity,
+        _wind_from_uv,
+    )
+
+    if df.empty or "station_key" not in df.columns or "datetime_utc" not in df.columns:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+
+    if "td" not in df.columns and {"q", "psfc"}.issubset(df.columns):
+        df["td"] = _dewpoint_from_specific_humidity(df["q"].to_numpy(), df["psfc"].to_numpy())
+
+    if ("wind" not in df.columns or "wind_dir" not in df.columns) and {"u", "v"}.issubset(
+        df.columns
+    ):
+        wind, wind_dir = _wind_from_uv(df["u"].to_numpy(), df["v"].to_numpy())
+        if "wind" not in df.columns:
+            df["wind"] = wind
+        if "wind_dir" not in df.columns:
+            df["wind_dir"] = wind_dir
+
+    return _collapse_duplicate_timestamps(df)
 
 
 def _resolve_station_rso(
@@ -322,9 +375,25 @@ def _process_station_group(
 
         if min_por_days > 0:
             obs_count = pd.to_numeric(grp.get("obs_count", pd.Series(dtype=float)), errors="coerce")
-            sufficient_days = int((obs_count >= 18).sum())
+            required_hours = required_hours_for_source(source)
+            sufficient_days = int((obs_count >= required_hours).sum())
             if sufficient_days < min_por_days:
-                return None, None, None
+                return (
+                    None,
+                    None,
+                    _build_qc_skip_record(
+                        source=source,
+                        station_key=station_key,
+                        bucket_id=bucket_id,
+                        qc_name="min_por_days",
+                        reason="insufficient_por_days",
+                        details=(
+                            f"sufficient_days={sufficient_days},"
+                            f"required_days={min_por_days},"
+                            f"required_hours={required_hours}"
+                        ),
+                    ),
+                )
 
         rso = None
         rs_qc_skip = None
@@ -423,8 +492,152 @@ def _aggregate_one_file(args: tuple) -> dict[str, object]:
         if df.empty:
             return {"daily": None, "failure": None}
 
+    df = _drop_failed_hourly_rows(df)
+    if df.empty:
+        return {"daily": None, "failure": None}
+
     daily = aggregate_daily_wide(df, prov)
     return {"daily": daily if not daily.empty else None, "failure": None}
+
+
+# ------------------------------------------------------------------ #
+# Pass 1 worker: passthrough for daily-native sources (RAWS, SNOTEL)
+# ------------------------------------------------------------------ #
+
+# Sources whose normalized parquets are already at daily resolution
+_DAILY_NATIVE_SOURCES = {"raws", "snotel"}
+
+
+def _derive_station_key(source: str, filepath: Path) -> tuple[str, str]:
+    """Derive (station_key, source_station_id) from filename for sources with NaN metadata."""
+    import re
+
+    stem = filepath.stem
+    if source == "snotel":
+        m = re.match(r"^(\d+)_", stem)
+        station_id = m.group(1) if m else stem
+        return f"snotel:{station_id}", station_id
+    return f"{source}:{stem}", stem
+
+
+def _passthrough_daily_file(args: tuple) -> dict[str, object]:
+    """Worker: read a daily-native per-station parquet, prepare for Pass 2.
+
+    Unlike _aggregate_one_file (which aggregates hourly→daily), this passes
+    through already-daily data with minimal transforms:
+    - Drop rows where qc_state == "fail"
+    - Ensure station_key/source/source_station_id are populated (derive from filename if NaN)
+    - Ensure obs_count exists (default 1)
+    - Apply date range filters
+    - RAWS-specific: rename rh_max→rhmax, rh_min→rhmin; convert rsds kWh/m²→MJ/m²/day
+    """
+    pf_str, source, start_date, end_date = args
+    pf = Path(pf_str)
+
+    try:
+        df = pd.read_parquet(pf)
+    except Exception as exc:
+        return {
+            "daily": None,
+            "failure": _build_file_failure_record(source=source, input_file=pf, exc=exc),
+        }
+
+    if df.empty or "date" not in df.columns:
+        return {"daily": None, "failure": None}
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], format="mixed")
+
+    # Derive station_key from filename when NaN (SNOTEL normalized data has all-NaN metadata)
+    station_key, station_id = _derive_station_key(source, pf)
+    if "station_key" not in df.columns or df["station_key"].isna().all():
+        df["station_key"] = station_key
+    if "source" not in df.columns or df["source"].isna().all():
+        df["source"] = source
+    if "source_station_id" not in df.columns or df["source_station_id"].isna().all():
+        df["source_station_id"] = station_id
+
+    # Date range filter
+    if start_date is not None:
+        df = df[df["date"].dt.date >= start_date]
+    if end_date is not None:
+        df = df[df["date"].dt.date <= end_date]
+    if df.empty:
+        return {"daily": None, "failure": None}
+
+    df = _drop_failed_hourly_rows(df)
+    if df.empty:
+        return {"daily": None, "failure": None}
+
+    if "obs_count" not in df.columns:
+        df["obs_count"] = 1
+    if "qc_state" not in df.columns:
+        df["qc_state"] = "pass"
+
+    # RAWS-specific transforms
+    if source == "raws":
+        if "rh_max" in df.columns and "rhmax" not in df.columns:
+            df = df.rename(columns={"rh_max": "rhmax"})
+        if "rh_min" in df.columns and "rhmin" not in df.columns:
+            df = df.rename(columns={"rh_min": "rhmin"})
+        # Convert rsds from kWh/m² to MJ/m²/day (1 kWh = 3.6 MJ)
+        if "rsds" in df.columns:
+            df["rsds"] = pd.to_numeric(df["rsds"], errors="coerce") * 3.6
+
+    return {"daily": df if not df.empty else None, "failure": None}
+
+
+def _stage_gdas_hourly_file(args: tuple) -> dict[str, object]:
+    """Worker: read one GDAS normalized parquet and stage hourly rows by bucket."""
+    pf_str, prov_dict, start_date, end_date, stage_dir_str, n_buckets = args
+    pf = Path(pf_str)
+    stage_dir = Path(stage_dir_str)
+
+    try:
+        df = pd.read_parquet(pf)
+    except Exception as exc:
+        return {
+            "failure": _build_file_failure_record(
+                source=str(prov_dict.get("source", "")),
+                input_file=pf,
+                exc=exc,
+            ),
+            "bucket_files": 0,
+            "rows": 0,
+        }
+
+    if df.empty or "station_key" not in df.columns or "datetime_utc" not in df.columns:
+        return {"failure": None, "bucket_files": 0, "rows": 0}
+
+    df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True)
+    if start_date is not None:
+        df = df[df["datetime_utc"].dt.date >= start_date]
+    if end_date is not None:
+        df = df[df["datetime_utc"].dt.date <= end_date]
+    if df.empty:
+        return {"failure": None, "bucket_files": 0, "rows": 0}
+
+    df = _drop_failed_hourly_rows(df)
+    if df.empty:
+        return {"failure": None, "bucket_files": 0, "rows": 0}
+
+    df = _prepare_gdas_hourly(df)
+    if df.empty:
+        return {"failure": None, "bucket_files": 0, "rows": 0}
+
+    df["_bucket"] = df["station_key"].apply(_bucket_id, n_buckets=n_buckets)
+
+    bucket_files = 0
+    rows = 0
+    for bid, grp in df.groupby("_bucket"):
+        bucket_dir = stage_dir / f"bucket_{int(bid):03d}"
+        bucket_dir.mkdir(parents=True, exist_ok=True)
+        out_path = bucket_dir / f"{pf.stem}.parquet"
+        grp.drop(columns=["_bucket"]).to_parquet(out_path, index=False, compression="snappy")
+        bucket_files += 1
+        rows += len(grp)
+
+    return {"failure": None, "bucket_files": bucket_files, "rows": rows}
 
 
 # ------------------------------------------------------------------ #
@@ -478,6 +691,276 @@ def _process_bucket(args: tuple) -> dict[str, object]:
     return {"stats": stats, "failures": failures, "qc_skips": qc_skips}
 
 
+def _process_gdas_bucket(args: tuple) -> dict[str, object]:
+    """Worker: stitch GDAS hourly shards for one bucket, aggregate, QC, and write."""
+    (
+        bucket_dir_str,
+        bucket_id,
+        prov_dict,
+        variable_columns,
+        out_dir_str,
+        source,
+        use_rsun_raster,
+        station_coords,
+        rsun_path,
+        min_por_days,
+    ) = args
+
+    bucket_dir = Path(bucket_dir_str)
+    out_dir = Path(out_dir_str)
+    hourly_files = sorted(bucket_dir.glob("*.parquet"))
+    if not hourly_files:
+        return {"stats": {}, "failures": [], "qc_skips": []}
+
+    prov = RunProvenance(**prov_dict)
+    frames = [pd.read_parquet(pf) for pf in hourly_files]
+    hourly = pd.concat(frames, ignore_index=True)
+    hourly = _prepare_gdas_hourly(hourly)
+    if hourly.empty:
+        return {"stats": {}, "failures": [], "qc_skips": []}
+
+    daily = aggregate_daily_wide(hourly, prov)
+    if daily.empty:
+        return {"stats": {}, "failures": [], "qc_skips": []}
+
+    stats: dict[str, int] = {}
+    failures: list[dict[str, str | int]] = []
+    qc_skips: list[dict[str, str | int]] = []
+
+    for station_key, grp in daily.groupby("station_key"):
+        station_key = str(station_key)
+        row_count, failure, rs_qc_skip = _process_station_group(
+            station_key,
+            grp,
+            variable_columns=variable_columns,
+            out_dir=out_dir,
+            source=source,
+            bucket_id=bucket_id,
+            use_rsun_raster=use_rsun_raster,
+            station_coords=station_coords,
+            rsun_path=rsun_path,
+            min_por_days=min_por_days,
+        )
+        if failure is not None:
+            failures.append(failure)
+            continue
+        if rs_qc_skip is not None:
+            qc_skips.append(rs_qc_skip)
+        if row_count is not None:
+            stats[station_key] = row_count
+
+    return {"stats": stats, "failures": failures, "qc_skips": qc_skips}
+
+
+def _build_station_por_gdas(
+    source: str,
+    parquet_files: list[Path],
+    out_dir: Path,
+    provenance: RunProvenance,
+    *,
+    start_date,
+    end_date,
+    variable_columns: list[str],
+    n_buckets: int,
+    station_index_path: Path | str | None,
+    rsun_path: Path | str | None,
+    min_por_days: int,
+    workers: int,
+) -> dict[str, int]:
+    """Build GDAS station POR using stitched hourly rows across file boundaries."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    use_parallel = workers > 1
+    n_files = len(parquet_files)
+
+    prov_dict = {
+        "run_id": provenance.run_id,
+        "schema_version": provenance.schema_version,
+        "qaqc_rules_version": provenance.qaqc_rules_version,
+        "crosswalk_version": provenance.crosswalk_version,
+        "transform_version": provenance.transform_version,
+        "source": provenance.source,
+        "command": provenance.command,
+    }
+
+    stage_dir = out_dir / _GDAS_STAGE_DIRNAME
+    shutil.rmtree(stage_dir, ignore_errors=True)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "Pass 1 (GDAS): reading %d files, staging hourly rows by bucket (%d workers)",
+        n_files,
+        workers,
+    )
+
+    failures: list[dict[str, str | int]] = []
+    qc_skips: list[dict[str, str | int]] = []
+    staged_bucket_files = 0
+    staged_rows = 0
+
+    if use_parallel:
+        task_args = [
+            (str(pf), prov_dict, start_date, end_date, str(stage_dir), n_buckets)
+            for pf in parquet_files
+        ]
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_stage_gdas_hourly_file, a): i for i, a in enumerate(task_args)}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                result = future.result()
+                failure = result["failure"]
+                if failure is not None:
+                    failures.append(failure)
+                staged_bucket_files += int(result["bucket_files"])
+                staged_rows += int(result["rows"])
+                if done_count % 500 == 0:
+                    logger.info("  GDAS pass 1: %d/%d files done", done_count, n_files)
+    else:
+        for i, pf in enumerate(parquet_files):
+            result = _stage_gdas_hourly_file(
+                (str(pf), prov_dict, start_date, end_date, str(stage_dir), n_buckets)
+            )
+            failure = result["failure"]
+            if failure is not None:
+                failures.append(failure)
+            staged_bucket_files += int(result["bucket_files"])
+            staged_rows += int(result["rows"])
+            if (i + 1) % 200 == 0:
+                logger.info("  GDAS pass 1: %d/%d files", i + 1, n_files)
+
+    if staged_bucket_files == 0:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        report_path = _write_failure_report(out_dir, source, provenance.run_id, failures, qc_skips)
+        logger.warning("No GDAS hourly data staged from %d files", n_files)
+        logger.warning("Station POR report written to %s", report_path)
+        return {}
+
+    logger.info(
+        "GDAS pass 1 complete: %d bucket files, %d hourly rows staged",
+        staged_bucket_files,
+        staged_rows,
+    )
+
+    use_rsun_raster = rsun_path is not None and station_index_path is not None
+    station_coords: dict[str, tuple[float, float]] = {}
+    if use_rsun_raster:
+        idx_path = Path(station_index_path)
+        if idx_path.exists():
+            idx_df = pd.read_parquet(idx_path)
+            for _, row in idx_df.iterrows():
+                key = row.get("canonical_id") or row.get("station_key")
+                if key and pd.notna(row.get("lat")) and pd.notna(row.get("lon")):
+                    station_coords[str(key)] = (float(row["lon"]), float(row["lat"]))
+            logger.info("Loaded %d station coords for RSUN Rso lookup", len(station_coords))
+        else:
+            use_rsun_raster = False
+
+    logger.info("Pass 2 (GDAS): stitching buckets and applying QC (%d workers)", workers)
+
+    stats: dict[str, int] = {}
+    bucket_dirs = [
+        stage_dir / f"bucket_{bid:03d}"
+        for bid in range(n_buckets)
+        if (stage_dir / f"bucket_{bid:03d}").exists()
+    ]
+
+    if use_parallel:
+        bucket_tasks = [
+            (
+                str(bucket_dir),
+                int(bucket_dir.name.split("_")[-1]),
+                prov_dict,
+                variable_columns,
+                str(out_dir),
+                source,
+                use_rsun_raster,
+                station_coords,
+                str(rsun_path) if rsun_path else None,
+                min_por_days,
+            )
+            for bucket_dir in bucket_dirs
+        ]
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_process_gdas_bucket, t): i for i, t in enumerate(bucket_tasks)}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                bucket_result = future.result()
+                stats.update(bucket_result["stats"])
+                failures.extend(bucket_result["failures"])
+                qc_skips.extend(bucket_result["qc_skips"])
+                if done_count % 10 == 0:
+                    logger.info(
+                        "  GDAS pass 2: %d/%d buckets done, %d stations, %d failures, %d QC skips",
+                        done_count,
+                        len(bucket_tasks),
+                        len(stats),
+                        len(failures),
+                        len(qc_skips),
+                    )
+    else:
+        manifest_path = out_dir / "manifest.parquet"
+        manifest = Manifest(manifest_path, source=source)
+
+        for bucket_dir in bucket_dirs:
+            bucket_result = _process_gdas_bucket(
+                (
+                    str(bucket_dir),
+                    int(bucket_dir.name.split("_")[-1]),
+                    prov_dict,
+                    variable_columns,
+                    str(out_dir),
+                    source,
+                    use_rsun_raster,
+                    station_coords,
+                    str(rsun_path) if rsun_path else None,
+                    min_por_days,
+                )
+            )
+            stats.update(bucket_result["stats"])
+            failures.extend(bucket_result["failures"])
+            qc_skips.extend(bucket_result["qc_skips"])
+            for sk in bucket_result["stats"]:
+                manifest.update(sk, "done", run_id=provenance.run_id)
+            if len(stats) and len(stats) % 500 == 0:
+                logger.info(
+                    "  GDAS pass 2: %d stations written, %d failures, %d QC skips",
+                    len(stats),
+                    len(failures),
+                    len(qc_skips),
+                )
+
+        manifest.flush()
+
+    if use_parallel:
+        manifest_path = out_dir / "manifest.parquet"
+        manifest = Manifest(manifest_path, source=source)
+        for sk in stats:
+            manifest.update(sk, "done", run_id=provenance.run_id)
+        manifest.flush()
+
+    shutil.rmtree(stage_dir, ignore_errors=True)
+
+    report_path = _write_failure_report(out_dir, source, provenance.run_id, failures, qc_skips)
+    if failures:
+        logger.warning(
+            "GDAS station POR complete: %d stations, %d failures, %d QC skips (%s)",
+            len(stats),
+            len(failures),
+            len(qc_skips),
+            report_path,
+        )
+    else:
+        logger.info(
+            "GDAS station POR complete: %d stations, 0 failures, %d QC skips (%s)",
+            len(stats),
+            len(qc_skips),
+            report_path,
+        )
+    return stats
+
+
 def build_station_por(
     source: str,
     norm_dir: Path | str,
@@ -513,19 +996,51 @@ def build_station_por(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if variable_columns is None:
-        variable_columns = _VARIABLE_COLUMNS.get(source, [])
+        variable_columns = _station_por_variable_columns(source, _VARIABLE_COLUMNS.get(source, []))
 
     parquet_files = sorted(norm_dir.glob("*.parquet"))
     parquet_files = [p for p in parquet_files if p.name != "manifest.parquet"]
+
+    # Pre-filter by filename date when start/end are specified (YYYYMMDD stems)
+    if start_date is not None or end_date is not None:
+        filtered = []
+        for p in parquet_files:
+            try:
+                file_date = _date(int(p.stem[:4]), int(p.stem[4:6]), int(p.stem[6:8]))
+                if start_date is not None and file_date < start_date:
+                    continue
+                if end_date is not None and file_date > end_date:
+                    continue
+                filtered.append(p)
+            except (ValueError, IndexError):
+                filtered.append(p)  # non-date stems pass through unchanged
+        parquet_files = filtered
 
     if not parquet_files:
         logger.warning("No parquet files found in %s", norm_dir)
         return {}
 
+    if source == "gdas":
+        return _build_station_por_gdas(
+            source,
+            parquet_files,
+            out_dir,
+            provenance,
+            start_date=start_date,
+            end_date=end_date,
+            variable_columns=variable_columns,
+            n_buckets=n_buckets,
+            station_index_path=station_index_path,
+            rsun_path=rsun_path,
+            min_por_days=min_por_days,
+            workers=workers,
+        )
+
     n_files = len(parquet_files)
     use_parallel = workers > 1
+    is_daily_native = source in _DAILY_NATIVE_SOURCES
 
-    # Serialize provenance for worker pickling
+    # Serialize provenance for worker pickling (hourly sources only)
     prov_dict = {
         "run_id": provenance.run_id,
         "schema_version": provenance.schema_version,
@@ -536,12 +1051,25 @@ def build_station_por(
         "command": provenance.command,
     }
 
+    # Select worker function based on source type
+    if is_daily_native:
+        worker_fn = _passthrough_daily_file
+
+        def _make_args(pf):
+            return (str(pf), source, start_date, end_date)
+    else:
+        worker_fn = _aggregate_one_file
+
+        def _make_args(pf):
+            return (str(pf), prov_dict, start_date, end_date)
+
     # ------------------------------------------------------------------ #
-    # Pass 1: read day files → aggregate to daily → collect in memory
+    # Pass 1: read files → daily (aggregate or passthrough) → collect
     # ------------------------------------------------------------------ #
     logger.info(
-        "Pass 1: reading %d files, aggregating to daily (%d workers)",
+        "Pass 1: reading %d files%s (%d workers)",
         n_files,
+        " (daily passthrough)" if is_daily_native else ", aggregating to daily",
         workers,
     )
 
@@ -550,9 +1078,9 @@ def build_station_por(
     qc_skips: list[dict[str, str | int]] = []
 
     if use_parallel:
-        task_args = [(str(pf), prov_dict, start_date, end_date) for pf in parquet_files]
+        task_args = [_make_args(pf) for pf in parquet_files]
         with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_aggregate_one_file, a): i for i, a in enumerate(task_args)}
+            futures = {pool.submit(worker_fn, a): i for i, a in enumerate(task_args)}
             done_count = 0
             for future in as_completed(futures):
                 done_count += 1
@@ -567,7 +1095,7 @@ def build_station_por(
                     logger.info("  pass 1: %d/%d files done", done_count, n_files)
     else:
         for i, pf in enumerate(parquet_files):
-            result = _aggregate_one_file((str(pf), prov_dict, start_date, end_date))
+            result = worker_fn(_make_args(pf))
             failure = result["failure"]
             if failure is not None:
                 failures.append(failure)

@@ -184,6 +184,8 @@ REQUIRED_HOURS_BY_SOURCE = {
     "ghcnh": 4,  # SYNOP stations report as few as 4 obs/day (00,06,12,18 UTC)
     "gdas": 4,  # ADPSFC includes SYNOP stations (00,06,12,18 UTC = 4 distinct hours)
     "ndbc": 18,
+    "raws": 1,  # daily-native: 1 obs/day is sufficient
+    "snotel": 1,  # daily-native
 }
 
 # Variables and their aggregation method for daily rollup from hourly data

@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 _NORM_DIRS = {
     "ghcnd": "/mnt/mco_nas1/shared/obsmet/normalized/ghcnd",
     "ghcnh": "/mnt/mco_nas1/shared/obsmet/normalized/ghcnh",
+    "isd": "/mnt/mco_nas1/shared/obsmet/normalized/isd",
     "snotel": "/mnt/mco_nas1/shared/obsmet/normalized/snotel",
     "ndbc": "/mnt/mco_nas1/shared/obsmet/normalized/ndbc",
     "raws_wrcc": "/mnt/mco_nas1/shared/obsmet/normalized/raws_wrcc",
@@ -30,6 +31,9 @@ _NORM_DIRS = {
 _STATION_POR_DIRS = {
     "madis": "/mnt/mco_nas1/shared/obsmet/products/station_por/madis",
     "gdas": "/mnt/mco_nas1/shared/obsmet/products/station_por/gdas",
+    "raws": "/mnt/mco_nas1/shared/obsmet/products/station_por/raws",
+    "ndbc": "/mnt/mco_nas1/shared/obsmet/products/station_por/ndbc",
+    "snotel": "/mnt/mco_nas1/shared/obsmet/products/station_por/snotel",
 }
 
 
@@ -39,6 +43,7 @@ def _load_station_data(source: str, source_station_id: str, resolution: str) -> 
     if source in _STATION_POR_DIRS:
         por_dir = Path(_STATION_POR_DIRS[source])
         candidates = [
+            por_dir / f"{source}_{source_station_id}.parquet",
             por_dir / f"{source_station_id}.parquet",
             por_dir / f"{source}:{source_station_id}.parquet",
         ]
@@ -53,6 +58,15 @@ def _load_station_data(source: str, source_station_id: str, resolution: str) -> 
     # Per-station normalized files
     if source in _NORM_DIRS:
         norm_dir = Path(_NORM_DIRS[source])
+        if source == "isd":
+            frames = []
+            for f in sorted(norm_dir.glob(f"*_{source_station_id}-*.parquet")):
+                try:
+                    frames.append(pd.read_parquet(f))
+                except Exception:
+                    pass
+            if frames:
+                return pd.concat(frames, ignore_index=True)
         # Try exact filename match
         p = norm_dir / f"{source_station_id}.parquet"
         if p.exists():

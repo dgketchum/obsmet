@@ -1420,7 +1420,7 @@ def _build_station_por(
     from obsmet.products.station_por import build_station_por
 
     if source == "all":
-        sources = ["madis", "ghcnh", "ghcnd", "gdas", "ndbc", "snotel"]
+        sources = ["madis", "ghcnh", "ghcnd", "gdas", "ndbc", "snotel", "raws"]
     else:
         sources = [source]
 
