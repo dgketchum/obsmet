@@ -244,6 +244,7 @@ def download_snotel_hourly(
     elements: list[str] | None = None,
     states: list[str] | None = None,
     station_triplets: list[str] | None = None,
+    overwrite: bool = False,
     max_retries: int = 3,
     retry_delay: float = 5.0,
 ) -> dict[str, int]:
@@ -260,6 +261,7 @@ def download_snotel_hourly(
     elements : Element codes to download (default: WTEQ, SNWD, PREC, TOBS)
     states : Filter to specific states (e.g., ["MT", "ID"])
     station_triplets : Explicit list of triplets (overrides states filter)
+    overwrite : If True, re-download even if output file exists
     max_retries : Retry count for transient API failures
     retry_delay : Seconds between retries
 
@@ -311,8 +313,8 @@ def download_snotel_hourly(
         safe_name = triplet.replace(":", "_")
         out_path = out_dir / f"{safe_name}.parquet"
 
-        # Skip if already downloaded (resume semantics)
-        if out_path.exists():
+        # Skip if already downloaded (resume semantics), unless overwrite requested
+        if out_path.exists() and not overwrite:
             stats[triplet] = -1  # already exists
             continue
 

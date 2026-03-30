@@ -44,7 +44,7 @@ _DEFAULT_RAW_DIRS = {
     "gdas": "/nas/climate/gdas/prepbufr",
     "raws": "/nas/climate/raws/wrcc/station_data",
     "ndbc": "/nas/climate/ndbc/ndbc_records",
-    "snotel": "/nas/climate/snotel/snotel_records",
+    "snotel": "/nas/climate/snotel/hourly",
 }
 
 _DEFAULT_NORM_DIRS = {
@@ -1397,7 +1397,7 @@ def _ingest_ndbc(start, end, raw_dir, resume, dry_run, **_kw):
     click.echo(f"NDBC ingest done: {ok} ok, {fail} failed/missing")
 
 
-def _ingest_snotel(start, end, raw_dir, dry_run, **_kw):
+def _ingest_snotel(start, end, raw_dir, overwrite, dry_run, **_kw):
     """Download hourly SNOTEL data via NRCS AWDB REST API."""
     from pathlib import Path
 
@@ -1421,7 +1421,7 @@ def _ingest_snotel(start, end, raw_dir, dry_run, **_kw):
         return
 
     click.echo(f"SNOTEL: downloading hourly data {begin} to {finish} → {raw_dir}")
-    stats = download_snotel_hourly(raw_dir, begin, finish)
+    stats = download_snotel_hourly(raw_dir, begin, finish, overwrite=overwrite)
     done = sum(1 for v in stats.values() if v > 0)
     skipped = sum(1 for v in stats.values() if v == -1)
     empty = sum(1 for v in stats.values() if v == 0)
