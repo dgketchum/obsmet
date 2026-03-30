@@ -100,6 +100,7 @@ def ingest(source, raw_dir, bounds, qcr_mask, start, end, resume, workers, overw
         "gdas": _ingest_gdas,
         "raws": _ingest_raws,
         "ndbc": _ingest_ndbc,
+        "snotel": _ingest_snotel,
     }
     fn = _INGEST_DISPATCH.get(source)
     if fn is None:
@@ -1394,6 +1395,37 @@ def _ingest_ndbc(start, end, raw_dir, resume, dry_run, **_kw):
 
     manifest.flush()
     click.echo(f"NDBC ingest done: {ok} ok, {fail} failed/missing")
+
+
+def _ingest_snotel(start, end, raw_dir, dry_run, **_kw):
+    """Download hourly SNOTEL data via NRCS AWDB REST API."""
+    from pathlib import Path
+
+    from obsmet.sources.snotel.download import download_snotel_hourly
+
+    raw_dir = Path(raw_dir) if raw_dir else Path("/nas/climate/snotel/hourly")
+
+    if start is None or end is None:
+        click.echo("Error: --start and --end are required for snotel ingest.")
+        return
+
+    begin = start.strftime("%Y-%m-%d")
+    finish = end.strftime("%Y-%m-%d")
+
+    if dry_run:
+        from obsmet.sources.snotel.download import fetch_station_inventory
+
+        inv = fetch_station_inventory(active_only=False)
+        click.echo(f"SNOTEL: would download {len(inv)} stations, {begin} to {finish}")
+        click.echo(f"  output: {raw_dir}")
+        return
+
+    click.echo(f"SNOTEL: downloading hourly data {begin} to {finish} → {raw_dir}")
+    stats = download_snotel_hourly(raw_dir, begin, finish)
+    done = sum(1 for v in stats.values() if v > 0)
+    skipped = sum(1 for v in stats.values() if v == -1)
+    empty = sum(1 for v in stats.values() if v == 0)
+    click.echo(f"SNOTEL ingest done: {done} downloaded, {skipped} skipped, {empty} empty")
 
 
 # --------------------------------------------------------------------------- #

@@ -50,25 +50,6 @@ _UNIT_CONVERT = {
     "degF_to_degC": lambda f: (f - 32.0) * 5.0 / 9.0,
 }
 
-# Physical timezone by state (IANA names) for downstream local-day aggregation.
-# SNOTEL data timestamps use PST/AKST, but the station's physical timezone
-# matters for understanding when "midnight" actually occurs at the site.
-_STATE_TIMEZONE = {
-    "AK": "US/Alaska",
-    "AZ": "US/Arizona",  # no DST
-    "CA": "US/Pacific",
-    "CO": "US/Mountain",
-    "ID": "US/Mountain",
-    "MT": "US/Mountain",
-    "NM": "US/Mountain",
-    "NV": "US/Pacific",
-    "OR": "US/Pacific",
-    "SD": "US/Mountain",
-    "UT": "US/Mountain",
-    "WA": "US/Pacific",
-    "WY": "US/Mountain",
-}
-
 
 def fetch_station_inventory(
     *,
@@ -79,10 +60,9 @@ def fetch_station_inventory(
 
     Returns DataFrame with columns:
         station_triplet, station_id, state, name, lat, lon, elev_ft,
-        tz_offset, physical_tz, begin_date, end_date
+        tz_offset, begin_date, end_date
 
     tz_offset is the AWDB dataTimeZone (PST=-8 or AKST=-9, the DATA timezone).
-    physical_tz is the IANA timezone for the station's physical location.
     """
     url = f"{AWDB_BASE}/stations"
     params = {
@@ -102,18 +82,16 @@ def fetch_station_inventory(
     for s in raw:
         if s.get("networkCode") != network:
             continue
-        state = s.get("stateCode", "")
         records.append(
             {
                 "station_triplet": s.get("stationTriplet"),
                 "station_id": s.get("stationId"),
-                "state": state,
+                "state": s.get("stateCode"),
                 "name": s.get("name"),
                 "lat": s.get("latitude"),
                 "lon": s.get("longitude"),
                 "elev_ft": s.get("elevation"),
                 "tz_offset": s.get("dataTimeZone"),
-                "physical_tz": _STATE_TIMEZONE.get(state, ""),
                 "begin_date": s.get("beginDate"),
                 "end_date": s.get("endDate"),
             }
@@ -368,7 +346,6 @@ def download_snotel_hourly(
         df["lat"] = meta.get("lat")
         df["lon"] = meta.get("lon")
         df["elev_ft"] = meta.get("elev_ft")
-        df["physical_tz"] = meta.get("physical_tz", "")
 
         df.to_parquet(out_path, index=False, compression="snappy")
         stats[triplet] = len(df)
