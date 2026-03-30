@@ -86,28 +86,13 @@ def fetch_station_inventory(
     return df
 
 
-def fetch_hourly_data(
+def _fetch_hourly_chunk(
     station_triplet: str,
     begin_date: str,
     end_date: str,
-    elements: list[str] | None = None,
+    elements: list[str],
 ) -> pd.DataFrame:
-    """Fetch hourly data for a single station from AWDB REST API.
-
-    Parameters
-    ----------
-    station_triplet : e.g., "562:MT:SNTL"
-    begin_date, end_date : "YYYY-MM-DD"
-    elements : list of element codes (default: WTEQ, SNWD, PREC, TOBS)
-
-    Returns
-    -------
-    DataFrame with datetime_utc index and one column per element, values
-    converted to metric (mm, degC). Includes raw_tz_offset column for audit.
-    """
-    if elements is None:
-        elements = DEFAULT_ELEMENTS
-
+    """Fetch a single time chunk of hourly data from the AWDB REST API."""
     url = f"{AWDB_BASE}/data"
     params = {
         "stationTriplets": station_triplet,
@@ -118,7 +103,7 @@ def fetch_hourly_data(
         "periodRef": "END",
     }
 
-    resp = requests.get(url, params=params, timeout=120)
+    resp = requests.get(url, params=params, timeout=300)
     resp.raise_for_status()
     payload = resp.json()
 
@@ -162,6 +147,58 @@ def fetch_hourly_data(
             df[code] = pd.to_numeric(df[code], errors="coerce").apply(_UNIT_CONVERT["degF_to_degC"])
 
     return df
+
+
+# Maximum years per API request to avoid timeouts (~46s per 5 years)
+_CHUNK_YEARS = 5
+
+
+def fetch_hourly_data(
+    station_triplet: str,
+    begin_date: str,
+    end_date: str,
+    elements: list[str] | None = None,
+) -> pd.DataFrame:
+    """Fetch hourly data for a single station from AWDB REST API.
+
+    Automatically chunks long date ranges into multi-year windows to avoid
+    API timeouts. A 36-year request becomes ~8 sequential API calls.
+
+    Parameters
+    ----------
+    station_triplet : e.g., "562:MT:SNTL"
+    begin_date, end_date : "YYYY-MM-DD"
+    elements : list of element codes (default: WTEQ, SNWD, PREC, TOBS)
+
+    Returns
+    -------
+    DataFrame with datetime_local and one column per element, values
+    converted to metric (mm, degC).
+    """
+    if elements is None:
+        elements = DEFAULT_ELEMENTS
+
+    start = pd.Timestamp(begin_date)
+    end = pd.Timestamp(end_date)
+
+    # Build year-chunked date ranges
+    chunks = []
+    cursor = start
+    while cursor <= end:
+        chunk_end = min(cursor + pd.DateOffset(years=_CHUNK_YEARS) - pd.Timedelta(days=1), end)
+        chunks.append((cursor.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        cursor = chunk_end + pd.Timedelta(days=1)
+
+    frames = []
+    for c_start, c_end in chunks:
+        df = _fetch_hourly_chunk(station_triplet, c_start, c_end, elements)
+        if not df.empty:
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True)
 
 
 def _convert_to_utc(
