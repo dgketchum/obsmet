@@ -573,6 +573,12 @@ def _passthrough_daily_file(args: tuple) -> dict[str, object]:
         df["obs_count"] = 1
     if "qc_state" not in df.columns:
         df["qc_state"] = "pass"
+    if "day_basis" not in df.columns:
+        df["day_basis"] = "local"
+    if "coverage_flags" not in df.columns:
+        df["coverage_flags"] = "n=1,thresh=Y,am=N,pm=N"
+    if "qc_rules_version" not in df.columns:
+        df["qc_rules_version"] = "0.1.0"
 
     # RAWS-specific transforms
     if source == "raws":

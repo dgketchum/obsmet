@@ -32,15 +32,17 @@ DEFAULT_PRECEDENCE = PrecedenceConfig(
         "tw": ["ghcnh"],
     },
     daily={
-        "tmax": ["ghcnd", "snotel", "raws_wrcc"],
-        "tmin": ["ghcnd", "snotel", "raws_wrcc"],
-        "tmean": ["ghcnd", "snotel", "raws_wrcc"],
+        "tmax": ["ghcnd", "snotel", "raws_wrcc", "ndbc"],
+        "tmin": ["ghcnd", "snotel", "raws_wrcc", "ndbc"],
+        "tmean": ["ghcnd", "snotel", "raws_wrcc", "ndbc"],
         "prcp": ["ghcnd", "snotel", "raws_wrcc"],
         "swe": ["snotel"],
         "snow": ["ghcnd"],
         "snow_depth": ["ghcnd"],
-        "wind": ["ghcnd", "raws_wrcc", "snotel"],
+        "wind": ["ghcnd", "raws_wrcc", "snotel", "ndbc"],
         "rh": ["raws_wrcc", "snotel"],
+        "td": ["ndbc"],
+        "slp": ["ndbc"],
     },
 )
 

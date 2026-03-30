@@ -17,7 +17,7 @@ from obsmet.crosswalk.precedence import PrecedenceConfig
 
 logger = logging.getLogger(__name__)
 
-# Where to find per-station data for each source
+# Where to find per-station normalized (hourly or daily) data
 _NORM_DIRS = {
     "ghcnd": "/mnt/mco_nas1/shared/obsmet/normalized/ghcnd",
     "ghcnh": "/mnt/mco_nas1/shared/obsmet/normalized/ghcnh",
@@ -27,20 +27,34 @@ _NORM_DIRS = {
     "raws_wrcc": "/mnt/mco_nas1/shared/obsmet/normalized/raws_wrcc",
 }
 
-# Per-day sources need station_por products instead
+# Sources with station_por products (daily aggregation + Tier 2 QC).
+# Keyed by the crosswalk/precedence source name (not the CLI alias).
+# For resolution="daily", these are preferred over _NORM_DIRS.
+# For resolution="hourly", hourly-native sources (ndbc) skip this and use _NORM_DIRS.
 _STATION_POR_DIRS = {
     "madis": "/mnt/mco_nas1/shared/obsmet/products/station_por/madis",
     "gdas": "/mnt/mco_nas1/shared/obsmet/products/station_por/gdas",
-    "raws": "/mnt/mco_nas1/shared/obsmet/products/station_por/raws",
+    "raws_wrcc": "/mnt/mco_nas1/shared/obsmet/products/station_por/raws",
     "ndbc": "/mnt/mco_nas1/shared/obsmet/products/station_por/ndbc",
     "snotel": "/mnt/mco_nas1/shared/obsmet/products/station_por/snotel",
 }
 
+# Hourly-native sources that should NOT use station_por for hourly resolution
+_HOURLY_NATIVE_SOURCES = {"ndbc", "ghcnh"}
+
 
 def _load_station_data(source: str, source_station_id: str, resolution: str) -> pd.DataFrame | None:
-    """Load per-station data from normalized or station_por directory."""
-    # Try station_por first (for per-day sources)
-    if source in _STATION_POR_DIRS:
+    """Load per-station data from normalized or station_por directory.
+
+    For daily resolution, prefer station_por (QC'd daily aggregates) when available.
+    For hourly resolution, hourly-native sources (ndbc, ghcnh) use normalized data
+    directly — station_por files are daily and would be wrong for hourly fabric.
+    """
+    # Skip station_por for hourly-native sources when building hourly fabric
+    use_por = source in _STATION_POR_DIRS and not (
+        resolution == "hourly" and source in _HOURLY_NATIVE_SOURCES
+    )
+    if use_por:
         por_dir = Path(_STATION_POR_DIRS[source])
         candidates = [
             por_dir / f"{source}_{source_station_id}.parquet",
