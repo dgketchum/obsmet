@@ -542,29 +542,27 @@ class TestDailyNativeStationPor:
             }
         )
 
-    def _make_snotel_daily_df(self, n_days=100):
-        """Synthetic SNOTEL daily data matching normalized schema (NaN station_key, string date)."""
+    def _make_snotel_hourly_df(self, station_key="snotel:787", n_hours=72):
+        """Synthetic SNOTEL hourly data matching AWDB normalized schema."""
         rng = np.random.default_rng(42)
-        dates = pd.date_range("2020-01-01", periods=n_days, freq="D")
+        dt = pd.date_range("2024-01-01", periods=n_hours, freq="h", tz="UTC")
         return pd.DataFrame(
             {
-                "station_key": [np.nan] * n_days,
-                "source": [np.nan] * n_days,
-                "source_station_id": [np.nan] * n_days,
-                "date": dates.strftime("%Y-%m-%d %H:%M:%S"),  # string, like real data
-                "day_basis": "local",
-                "swe": rng.uniform(0, 200, n_days),
-                "tmin": rng.normal(-5, 5, n_days),
-                "tmax": rng.normal(5, 5, n_days),
-                "tmean": rng.normal(0, 5, n_days),
-                "prcp": np.where(rng.random(n_days) > 0.7, rng.exponential(4, n_days), 0.0),
-                "rh": rng.uniform(40, 95, n_days),
-                "wind": rng.uniform(0, 10, n_days),
+                "station_key": station_key,
+                "source": "snotel",
+                "source_station_id": station_key.split(":")[-1],
+                "datetime_utc": dt,
+                "tair": rng.normal(-5, 5, n_hours),
+                "swe": rng.uniform(100, 300, n_hours),
+                "snow_depth": rng.uniform(500, 1000, n_hours),
+                "prcp": np.where(rng.random(n_hours) > 0.8, rng.exponential(2, n_hours), 0.0),
+                "lat": 48.9,
+                "lon": -114.9,
+                "elev_m": 1841.0,
                 "qc_state": "pass",
-                "obs_count": 1,
+                "qc_reason_codes": "",
                 "ingest_run_id": "test",
                 "transform_version": "0.1.0",
-                "raw_source_uri": "/nas/climate/snotel/1002_Kraft_Creek_MT.csv",
             }
         )
 
@@ -587,22 +585,27 @@ class TestDailyNativeStationPor:
             orig_rsds = df["rsds"].iloc[0]
             assert daily["rsds"].iloc[0] == pytest.approx(orig_rsds * 3.6)
 
-    def test_snotel_passthrough_derives_station_key_from_filename(self):
-        """SNOTEL passthrough should derive station_key from filename when NaN."""
-        df = self._make_snotel_daily_df()
+    def test_snotel_hourly_aggregates_to_daily(self):
+        """SNOTEL hourly data should aggregate to daily via standard path."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            pf = Path(tmpdir) / "1002_Kraft_Creek_MT.parquet"
-            df.to_parquet(pf, index=False)
+            norm_dir = Path(tmpdir) / "normalized"
+            norm_dir.mkdir()
+            out_dir = Path(tmpdir) / "station_por"
 
-            result = _passthrough_daily_file((str(pf), "snotel", None, None))
-            daily = result["daily"]
+            df = self._make_snotel_hourly_df(n_hours=72)
+            df.to_parquet(norm_dir / "787_MT_SNTL.parquet", index=False)
 
-            assert daily is not None
-            assert (daily["station_key"] == "snotel:1002").all()
-            assert (daily["source"] == "snotel").all()
-            assert (daily["source_station_id"] == "1002").all()
-            # date should be coerced from string to datetime
-            assert pd.api.types.is_datetime64_any_dtype(daily["date"])
+            provenance = RunProvenance(source="snotel", command="test")
+            stats = build_station_por("snotel", norm_dir, out_dir, provenance)
+
+            assert "snotel:787" in stats
+            result = pd.read_parquet(out_dir / "snotel_787.parquet")
+            # 72 hours = 3 days
+            assert len(result) == 3
+            # tair → tmax/tmin/tmean derived
+            assert "tmax" in result.columns
+            assert "tmin" in result.columns
+            assert "swe" in result.columns
 
     def test_raws_build_station_por_end_to_end(self):
         """Full build_station_por for RAWS produces correct output."""
@@ -634,24 +637,24 @@ class TestDailyNativeStationPor:
             assert "rh_corrected" in result.columns
 
     def test_snotel_build_station_por_end_to_end(self):
-        """Full build_station_por for SNOTEL with NaN station_key."""
+        """Full build_station_por for SNOTEL hourly data."""
         with tempfile.TemporaryDirectory() as tmpdir:
             norm_dir = Path(tmpdir) / "normalized"
             norm_dir.mkdir()
             out_dir = Path(tmpdir) / "station_por"
 
-            df = self._make_snotel_daily_df(n_days=200)
-            df.to_parquet(norm_dir / "1002_Kraft_Creek_MT.parquet", index=False)
+            df = self._make_snotel_hourly_df("snotel:787", n_hours=200)
+            df.to_parquet(norm_dir / "787_MT_SNTL.parquet", index=False)
 
             provenance = RunProvenance(source="snotel", command="test")
             stats = build_station_por("snotel", norm_dir, out_dir, provenance)
 
-            assert "snotel:1002" in stats
-            out_path = out_dir / "snotel_1002.parquet"
+            assert "snotel:787" in stats
+            out_path = out_dir / "snotel_787.parquet"
             assert out_path.exists()
 
             result = pd.read_parquet(out_path)
-            assert (result["station_key"] == "snotel:1002").all()
+            assert (result["station_key"] == "snotel:787").all()
             assert "qc_state" in result.columns
             assert "swe" in result.columns
             assert "prcp" in result.columns

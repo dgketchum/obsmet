@@ -501,11 +501,12 @@ def _aggregate_one_file(args: tuple) -> dict[str, object]:
 
 
 # ------------------------------------------------------------------ #
-# Pass 1 worker: passthrough for daily-native sources (RAWS, SNOTEL)
+# Pass 1 worker: passthrough for daily-native sources (RAWS)
 # ------------------------------------------------------------------ #
 
-# Sources whose normalized parquets are already at daily resolution
-_DAILY_NATIVE_SOURCES = {"raws", "snotel"}
+# Sources whose normalized parquets are already at daily resolution.
+# SNOTEL was here but moved to hourly after AWDB adapter integration.
+_DAILY_NATIVE_SOURCES = {"raws"}
 
 
 def _derive_station_key(source: str, filepath: Path) -> tuple[str, str]:

@@ -26,7 +26,7 @@ _TEMPORAL_RES = {
     "ghcnd": "daily",
     "ghcnh": "hourly",
     "isd": "hourly",
-    "snotel": "daily",
+    "snotel": "hourly",
     "ndbc": "hourly",
     "raws_wrcc": "daily",
     "madis": "hourly",

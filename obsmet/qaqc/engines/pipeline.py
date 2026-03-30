@@ -71,7 +71,7 @@ _VARIABLE_COLUMNS: dict[str, list[str]] = {
     "gdas": ["tair", "td", "wind", "wind_dir", "psfc", "prcp"],
     "raws": ["tmean", "tmax", "tmin", "wind", "wind_dir", "rh", "prcp", "rsds"],
     "ndbc": ["tair", "td", "wind", "wind_dir", "slp"],
-    "snotel": ["tmax", "tmin", "tmean", "prcp", "swe", "rh", "wind"],
+    "snotel": ["tmax", "tmin", "tmean", "prcp", "swe", "snow_depth"],
 }
 
 # Maps canonical variable names back to MADIS native names for DD/QCR column lookup

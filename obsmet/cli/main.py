@@ -114,6 +114,7 @@ def ingest(source, raw_dir, bounds, qcr_mask, start, end, resume, workers, overw
         qcr_mask=qcr_mask,
         resume=resume,
         workers=workers,
+        overwrite=overwrite,
         dry_run=dry_run,
     )
 

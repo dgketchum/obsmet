@@ -49,7 +49,7 @@ class TestAggregateConstants:
         assert required_hours_for_source("gdas") == 4
         assert required_hours_for_source("madis") == 18
         assert required_hours_for_source("raws") == 1
-        assert required_hours_for_source("snotel") == 1
+        assert required_hours_for_source("snotel") == 4
         assert required_hours_for_source("unknown") == 18
 
 

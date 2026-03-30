@@ -175,7 +175,7 @@ def circular_mean_deg(angles: pd.Series) -> float:
 # --------------------------------------------------------------------------- #
 
 # Sources that support hourly → daily aggregation
-DAILY_SOURCES = ["madis", "ghcnh", "gdas", "ndbc"]
+DAILY_SOURCES = ["madis", "ghcnh", "gdas", "ndbc", "snotel"]
 
 # Source-specific daily coverage thresholds. GDAS currently keeps the same
 # 18-hour requirement as MADIS, but making it explicit avoids hidden defaults.
@@ -185,7 +185,7 @@ REQUIRED_HOURS_BY_SOURCE = {
     "gdas": 4,  # ADPSFC includes SYNOP stations (00,06,12,18 UTC = 4 distinct hours)
     "ndbc": 18,
     "raws": 1,  # daily-native: 1 obs/day is sufficient
-    "snotel": 1,  # daily-native
+    "snotel": 4,  # hourly AWDB data; coverage varies, 4 distinct hours sufficient
 }
 
 # Variables and their aggregation method for daily rollup from hourly data
@@ -198,6 +198,8 @@ DAILY_AGG_MAP = {
     "slp": "mean",
     "psfc": "mean",
     "prcp": "sum",
+    "swe": "mean",  # instantaneous; daily mean represents end-of-day state
+    "snow_depth": "mean",  # instantaneous; daily mean
 }
 
 
