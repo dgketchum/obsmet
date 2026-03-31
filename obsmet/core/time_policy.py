@@ -313,30 +313,42 @@ def aggregate_daily_wide(
             if not rsds_vals.empty:
                 rec["rsds"] = float(rsds_vals.mean()) * 86400.0 / 1e6
 
-        # Aggregate per-variable QC state from hourly to daily
+        # Aggregate per-variable QC state from hourly to daily.
+        # Only consider hours where the variable value is non-null — failed hours
+        # have their values nulled by _drop_failed_hourly_rows, so they don't
+        # contribute to the daily aggregate and shouldn't poison the daily QC state.
         for var_qc_col in (c for c in grp.columns if c.endswith("_qc_state")):
             var_name = var_qc_col.removesuffix("_qc_state")
-            rec[var_qc_col] = _aggregate_qc_state(grp[var_qc_col])
-            # Also aggregate per-variable reason codes if present
+            if var_name in grp.columns:
+                valid_mask = pd.to_numeric(grp[var_name], errors="coerce").notna()
+                rec[var_qc_col] = _aggregate_qc_state(grp.loc[valid_mask, var_qc_col])
+            else:
+                rec[var_qc_col] = _aggregate_qc_state(grp[var_qc_col])
             var_reason_col = f"{var_name}_qc_reason_codes"
             if var_reason_col in grp.columns:
-                rec[var_reason_col] = _aggregate_qc_reasons(grp[var_reason_col])
+                if var_name in grp.columns:
+                    rec[var_reason_col] = _aggregate_qc_reasons(grp.loc[valid_mask, var_reason_col])
+                else:
+                    rec[var_reason_col] = _aggregate_qc_reasons(grp[var_reason_col])
 
-        # Also propagate per-variable QC for derived variables (tmax/tmin/tmean from tair)
+        # Propagate per-variable QC for derived variables (tmax/tmin/tmean from tair)
         if "tair_qc_state" in grp.columns and "tair" in grp.columns:
-            tair_qc = _aggregate_qc_state(grp["tair_qc_state"])
+            valid_tair = pd.to_numeric(grp["tair"], errors="coerce").notna()
+            tair_qc = _aggregate_qc_state(grp.loc[valid_tair, "tair_qc_state"])
             for derived in ("tmax", "tmin", "tmean"):
                 rec[f"{derived}_qc_state"] = tair_qc
 
         # Propagate rh QC to derived rhmax/rhmin
         if "rh_qc_state" in grp.columns and "rh" in grp.columns:
-            rh_qc = _aggregate_qc_state(grp["rh_qc_state"])
+            valid_rh = pd.to_numeric(grp["rh"], errors="coerce").notna()
+            rh_qc = _aggregate_qc_state(grp.loc[valid_rh, "rh_qc_state"])
             for derived in ("rhmax", "rhmin"):
                 rec[f"{derived}_qc_state"] = rh_qc
 
         # Propagate rsds_hourly QC to derived rsds
-        if "rsds_hourly_qc_state" in grp.columns:
-            rec["rsds_qc_state"] = _aggregate_qc_state(grp["rsds_hourly_qc_state"])
+        if "rsds_hourly_qc_state" in grp.columns and "rsds_hourly" in grp.columns:
+            valid_rsds = pd.to_numeric(grp["rsds_hourly"], errors="coerce").notna()
+            rec["rsds_qc_state"] = _aggregate_qc_state(grp.loc[valid_rsds, "rsds_hourly_qc_state"])
 
         # Carry station metadata (first non-null value in group)
         for meta_col in ("lat", "lon", "elev_m"):

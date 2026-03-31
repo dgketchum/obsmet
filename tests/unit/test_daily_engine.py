@@ -162,6 +162,32 @@ class TestAggregateDailyWide:
         assert result.loc[0, "qc_state"] == "suspect"
         assert "qm9_missing_obs_error" in result.loc[0, "qc_reason_codes"]
 
+    def test_per_variable_daily_qc_ignores_nulled_hours(self, provenance):
+        """Daily per-variable QC should only reflect hours where the variable is non-null.
+
+        When td fails on hours 0-11 (nulled by upstream per-variable filtering)
+        but passes on hours 12-23, the daily td_qc_state should be 'pass' because
+        only the passing hours contributed to the daily td value.
+        """
+        df = _make_hourly("test:001", "2024-01-15", tair=10.0)
+        df["td"] = [np.nan] * 12 + [5.0] * 12  # nulled by upstream QC
+        df["td_qc_state"] = ["fail"] * 12 + ["pass"] * 12
+        df["td_qc_reason_codes"] = ["td:M"] * 12 + [""] * 12
+        df["tair_qc_state"] = ["pass"] * 24
+        df["tair_qc_reason_codes"] = [""] * 24
+        df["qc_state"] = ["fail"] * 12 + ["pass"] * 12
+        df["qc_reason_codes"] = ["td:M"] * 12 + [""] * 12
+        result = aggregate_daily_wide(df, provenance)
+        # Daily td value computed from 12 passing hours
+        assert pd.notna(result.loc[0, "td"])
+        assert result.loc[0, "td"] == pytest.approx(5.0)
+        # Daily td_qc_state should be pass (only non-null hours counted)
+        assert result.loc[0, "td_qc_state"] == "pass"
+        # Daily tair_qc_state should be pass (all hours passed)
+        assert result.loc[0, "tair_qc_state"] == "pass"
+        # Row-level qc_state is still fail (worst-of summary)
+        assert result.loc[0, "qc_state"] == "fail"
+
     def test_coverage_flags(self, provenance):
         df = _make_hourly("test:001", "2024-01-15", n_hours=24, tair=10.0)
         result = aggregate_daily_wide(df, provenance)
