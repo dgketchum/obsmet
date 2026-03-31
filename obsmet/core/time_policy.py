@@ -313,6 +313,31 @@ def aggregate_daily_wide(
             if not rsds_vals.empty:
                 rec["rsds"] = float(rsds_vals.mean()) * 86400.0 / 1e6
 
+        # Aggregate per-variable QC state from hourly to daily
+        for var_qc_col in (c for c in grp.columns if c.endswith("_qc_state")):
+            var_name = var_qc_col.removesuffix("_qc_state")
+            rec[var_qc_col] = _aggregate_qc_state(grp[var_qc_col])
+            # Also aggregate per-variable reason codes if present
+            var_reason_col = f"{var_name}_qc_reason_codes"
+            if var_reason_col in grp.columns:
+                rec[var_reason_col] = _aggregate_qc_reasons(grp[var_reason_col])
+
+        # Also propagate per-variable QC for derived variables (tmax/tmin/tmean from tair)
+        if "tair_qc_state" in grp.columns and "tair" in grp.columns:
+            tair_qc = _aggregate_qc_state(grp["tair_qc_state"])
+            for derived in ("tmax", "tmin", "tmean"):
+                rec[f"{derived}_qc_state"] = tair_qc
+
+        # Propagate rh QC to derived rhmax/rhmin
+        if "rh_qc_state" in grp.columns and "rh" in grp.columns:
+            rh_qc = _aggregate_qc_state(grp["rh_qc_state"])
+            for derived in ("rhmax", "rhmin"):
+                rec[f"{derived}_qc_state"] = rh_qc
+
+        # Propagate rsds_hourly QC to derived rsds
+        if "rsds_hourly_qc_state" in grp.columns:
+            rec["rsds_qc_state"] = _aggregate_qc_state(grp["rsds_hourly_qc_state"])
+
         # Carry station metadata (first non-null value in group)
         for meta_col in ("lat", "lon", "elev_m"):
             if meta_col in grp.columns:

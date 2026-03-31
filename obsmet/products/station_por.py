@@ -19,7 +19,7 @@ import pandas as pd
 
 from obsmet.core.manifest import Manifest
 from obsmet.core.provenance import RunProvenance
-from obsmet.core.time_policy import aggregate_daily_wide, required_hours_for_source
+from obsmet.core.time_policy import DAILY_AGG_MAP, aggregate_daily_wide, required_hours_for_source
 from obsmet.qaqc.rules.temporal import (
     MonthlyZScoreRule,
     RHDriftRule,
@@ -245,12 +245,18 @@ def _station_por_variable_columns(source: str, default_columns: list[str]) -> li
     return _STATION_POR_VARIABLE_COLUMNS.get(source, default_columns)
 
 
+# Variables that produce daily output via aggregation or derivation.
+# Only these are considered when deciding whether a row has usable data.
+_AGGREGATABLE_HOURLY_VARS = frozenset(list(DAILY_AGG_MAP.keys()) + ["rsds_hourly"])
+
+
 def _drop_failed_hourly_rows(df: pd.DataFrame) -> pd.DataFrame:
     """Filter QC failures: per-variable nulling when available, row-drop as fallback.
 
     When per-variable QC columns (``{var}_qc_state``) are present, nulls only
     the specific variables that failed while preserving good variables on the
-    same row. Drops rows only when all data columns are NaN after nulling.
+    same row. Drops rows only when all *aggregatable* data columns are NaN
+    after nulling (ancillary fields like wind_gust do not keep a row alive).
 
     When per-variable columns are absent (legacy normalized data), falls back
     to dropping entire rows where ``qc_state == "fail"``.
@@ -267,19 +273,18 @@ def _drop_failed_hourly_rows(df: pd.DataFrame) -> pd.DataFrame:
 
     # Per-variable nulling: null only variables where {var}_qc_state == "fail"
     df = df.copy()
-    data_cols = []
     for qc_col in var_qc_cols:
         var_name = qc_col.removesuffix("_qc_state")
         if var_name not in df.columns:
             continue
-        data_cols.append(var_name)
         fail_mask = df[qc_col].fillna("pass") == "fail"
         if fail_mask.any():
             df.loc[fail_mask, var_name] = np.nan
 
-    # Drop rows where ALL data columns are NaN (no usable data)
-    if data_cols:
-        all_nan = df[data_cols].isna().all(axis=1)
+    # Drop rows where ALL aggregatable columns are NaN (no usable daily output)
+    agg_cols = [c for c in _AGGREGATABLE_HOURLY_VARS if c in df.columns]
+    if agg_cols:
+        all_nan = df[agg_cols].isna().all(axis=1)
         df = df.loc[~all_nan]
 
     return df
