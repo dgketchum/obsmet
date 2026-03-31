@@ -38,10 +38,11 @@ _STATION_POR_DIRS = {
     "raws_wrcc": "/mnt/mco_nas1/shared/obsmet/products/station_por/raws",
     "ndbc": "/mnt/mco_nas1/shared/obsmet/products/station_por/ndbc",
     "snotel": "/mnt/mco_nas1/shared/obsmet/products/station_por/snotel",
+    "eccc": "/mnt/mco_nas1/shared/obsmet/products/station_por/eccc",
 }
 
 # Hourly-native sources that should NOT use station_por for hourly resolution
-_HOURLY_NATIVE_SOURCES = {"ndbc", "ghcnh"}
+_HOURLY_NATIVE_SOURCES = {"ndbc", "ghcnh", "eccc"}
 
 
 def _load_station_data(source: str, source_station_id: str, resolution: str) -> pd.DataFrame | None:
@@ -92,6 +93,13 @@ def _load_station_data(source: str, source_station_id: str, resolution: str) -> 
         # SNOTEL filenames include name and state
         if source == "snotel":
             for f in norm_dir.glob(f"{source_station_id}_*.parquet"):
+                try:
+                    return pd.read_parquet(f)
+                except Exception:
+                    pass
+        # ECCC filenames are {PROVINCE}_{CLIMATE_ID}.parquet
+        if source == "eccc":
+            for f in norm_dir.glob(f"*_{source_station_id}.parquet"):
                 try:
                     return pd.read_parquet(f)
                 except Exception:

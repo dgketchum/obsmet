@@ -239,11 +239,43 @@ def _station_por_variable_columns(source: str, default_columns: list[str]) -> li
 
 
 def _drop_failed_hourly_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Exclude hourly rows already failed by source-native/physical QC."""
+    """Filter QC failures: per-variable nulling when available, row-drop as fallback.
+
+    When per-variable QC columns (``{var}_qc_state``) are present, nulls only
+    the specific variables that failed while preserving good variables on the
+    same row. Drops rows only when all data columns are NaN after nulling.
+
+    When per-variable columns are absent (legacy normalized data), falls back
+    to dropping entire rows where ``qc_state == "fail"``.
+    """
     if df.empty or "qc_state" not in df.columns:
         return df
-    states = df["qc_state"].fillna("pass")
-    return df.loc[states != "fail"].copy()
+
+    # Check for per-variable QC columns
+    var_qc_cols = [c for c in df.columns if c.endswith("_qc_state")]
+    if not var_qc_cols:
+        # Legacy fallback: row-level drop
+        states = df["qc_state"].fillna("pass")
+        return df.loc[states != "fail"].copy()
+
+    # Per-variable nulling: null only variables where {var}_qc_state == "fail"
+    df = df.copy()
+    data_cols = []
+    for qc_col in var_qc_cols:
+        var_name = qc_col.removesuffix("_qc_state")
+        if var_name not in df.columns:
+            continue
+        data_cols.append(var_name)
+        fail_mask = df[qc_col].fillna("pass") == "fail"
+        if fail_mask.any():
+            df.loc[fail_mask, var_name] = np.nan
+
+    # Drop rows where ALL data columns are NaN (no usable data)
+    if data_cols:
+        all_nan = df[data_cols].isna().all(axis=1)
+        df = df.loc[~all_nan]
+
+    return df
 
 
 def _prepare_gdas_hourly(df: pd.DataFrame) -> pd.DataFrame:

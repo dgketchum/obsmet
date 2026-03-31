@@ -159,15 +159,19 @@ def normalize_hourly_csv(
     if lon is not None:
         out["lon"] = lon
 
-    # Map variables with unit conversion
-    qc_states = pd.Series("pass", index=out.index)
-    qc_reasons: list[list[str]] = [[] for _ in range(n)]
+    # Map variables with unit conversion and per-variable QC
+    _STATE_RANK = {"pass": 0, "suspect": 1, "fail": 2}
+    row_states = pd.Series("pass", index=out.index)
+    row_reasons: list[list[str]] = [[] for _ in range(n)]
 
     for csv_col, (canon_name, converter) in _COLUMN_MAP.items():
         if csv_col not in df.columns:
             continue
 
         vals = pd.to_numeric(df[csv_col], errors="coerce")
+        var_states = ["pass"] * n
+        var_reasons: list[list[str]] = [[] for _ in range(n)]
+
         flag_col = (
             csv_col.replace(" (°C)", "")
             .replace(" (%)", "")
@@ -179,7 +183,7 @@ def normalize_hourly_csv(
         )
         flag_col = flag_col + _FLAG_SUFFIX
 
-        # Apply QC flags
+        # Apply QC flags per variable
         if flag_col in df.columns:
             flags = df[flag_col].fillna("").str.strip()
             for i, flag in enumerate(flags):
@@ -189,20 +193,22 @@ def normalize_hourly_csv(
                 if mapped == "fail":
                     vals.iloc[i] = np.nan
                 if mapped != "pass":
-                    qc_states.iloc[i] = max(
-                        qc_states.iloc[i],
-                        mapped,
-                        key=lambda s: {"pass": 0, "suspect": 1, "fail": 2}[s],
-                    )
-                    qc_reasons[i].append(f"{canon_name}:{flag}")
+                    var_states[i] = mapped
+                    var_reasons[i].append(f"{canon_name}:{flag}")
+                    # Update row-level summary (worst wins)
+                    if _STATE_RANK[mapped] > _STATE_RANK[row_states.iloc[i]]:
+                        row_states.iloc[i] = mapped
+                    row_reasons[i].append(f"{canon_name}:{flag}")
 
         if converter is not None:
             vals = converter(vals)
 
         out[canon_name] = vals.values
+        out[f"{canon_name}_qc_state"] = var_states
+        out[f"{canon_name}_qc_reason_codes"] = [",".join(r) if r else "" for r in var_reasons]
 
-    out["qc_state"] = qc_states.values
-    out["qc_reason_codes"] = [",".join(r) for r in qc_reasons]
+    out["qc_state"] = row_states.values
+    out["qc_reason_codes"] = [",".join(r) if r else "" for r in row_reasons]
     out["ingest_run_id"] = provenance.run_id
     out["transform_version"] = provenance.transform_version
     out["raw_source_uri"] = str(csv_path)
