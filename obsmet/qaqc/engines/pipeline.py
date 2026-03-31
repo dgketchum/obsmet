@@ -13,6 +13,9 @@ import pandas as pd
 from obsmet.qaqc.rules.base import QCResult, QCRule
 
 
+_STATE_RANK = {"pass": 0, "suspect": 1, "fail": 2}
+
+
 @dataclass
 class QCPipeline:
     """Ordered chain of QC rules applied to observations."""
@@ -224,19 +227,22 @@ def apply_pipeline_to_df(
 
             results = pipeline.run(float(val), **ctx)
 
-            # Aggregate per-variable state
-            col_state = QCPipeline.aggregate_state(results)
-            col_reasons = QCPipeline.reason_codes(results)
+            # Aggregate per-variable state — merge with adapter-seeded state (worst wins)
+            pipeline_state = QCPipeline.aggregate_state(results)
+            pipeline_reasons = QCPipeline.reason_codes(results)
 
-            var_states[col][i] = col_state
-            var_reasons[col][i] = col_reasons
+            seeded = var_states[col][i]
+            if _STATE_RANK.get(pipeline_state, 0) >= _STATE_RANK.get(seeded, 0):
+                var_states[col][i] = pipeline_state
+            # Always accumulate reasons from both adapter and pipeline
+            for r in pipeline_reasons:
+                var_reasons[col][i].append(f"{col}:{r}")
 
-            # Accumulate row-level summary with variable-qualified reasons
-            if col_state == "fail":
-                row_states[i] = "fail"
-            elif col_state == "suspect" and row_states[i] != "fail":
-                row_states[i] = "suspect"
-            for r in col_reasons:
+            # Accumulate row-level summary (worst across all variables)
+            merged_var = var_states[col][i]
+            if _STATE_RANK.get(merged_var, 0) > _STATE_RANK.get(row_states[i], 0):
+                row_states[i] = merged_var
+            for r in pipeline_reasons:
                 row_reasons[i].append(f"{col}:{r}")
 
     df = df.copy()

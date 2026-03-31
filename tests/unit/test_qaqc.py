@@ -157,6 +157,34 @@ class TestApplyPipelineToDf:
         # Row-level should reflect the worst (fail from tair)
         assert result.iloc[0]["qc_state"] == "fail"
 
+    def test_preserves_adapter_suspect_on_non_null_values(self):
+        """Pipeline must not downgrade adapter 'suspect' to 'pass' for retained values.
+
+        Simulates ECCC: adapter keeps a flagged value non-null and marks it suspect.
+        The pipeline should merge (worst-of) with its own check, preserving suspect
+        even when the pipeline's own check passes.
+        """
+        df = pd.DataFrame(
+            {
+                "tair": [10.0],
+                "td": [5.0],
+                "tair_qc_state": ["suspect"],
+                "tair_qc_reason_codes": ["tair:E"],
+                "td_qc_state": ["pass"],
+                "td_qc_reason_codes": [""],
+                "qc_state": ["suspect"],
+                "qc_reason_codes": ["tair:E"],
+            }
+        )
+        pipeline = build_default_pipeline("isd")
+        result = apply_pipeline_to_df(df, pipeline, ["tair", "td"], source="isd")
+        # tair=10.0 passes physical bounds, but adapter said suspect — must stay suspect
+        assert result.iloc[0]["tair_qc_state"] == "suspect"
+        assert "tair:E" in result.iloc[0]["tair_qc_reason_codes"]
+        assert result.iloc[0]["td_qc_state"] == "pass"
+        # Row-level should still be suspect
+        assert result.iloc[0]["qc_state"] == "suspect"
+
     def test_replaces_qc_passed(self):
         df = pd.DataFrame(
             {
