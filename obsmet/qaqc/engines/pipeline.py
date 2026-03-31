@@ -141,21 +141,35 @@ def apply_pipeline_to_df(
     *,
     source: str = "",
 ) -> pd.DataFrame:
-    """Apply QC pipeline to a wide-form DataFrame, writing qc_state/qc_reason_codes columns.
+    """Apply QC pipeline to a wide-form DataFrame, writing per-variable and row-level QC.
 
-    Iterates rows; for each variable column, runs pipeline.run() with appropriate context.
-    Aggregates across all variables per row: worst state wins.
+    For each variable column, runs pipeline.run() and writes:
+      - ``{var}_qc_state``: per-variable state (pass/suspect/fail)
+      - ``{var}_qc_reason_codes``: per-variable reason codes
+
+    Row-level summary columns are derived from per-variable states:
+      - ``qc_state``: worst-of across all variables
+      - ``qc_reason_codes``: variable-qualified reasons (e.g., ``tair:out_of_bounds``)
     """
     is_madis = source == "madis"
     is_gdas = source == "gdas"
 
-    qc_states = []
-    qc_reasons = []
+    n = len(df)
+    # Per-variable accumulators
+    var_states: dict[str, list[str]] = {
+        col: ["pass"] * n for col in variable_columns if col in df.columns
+    }
+    var_reasons: dict[str, list[list[str]]] = {
+        col: [[] for _ in range(n)] for col in variable_columns if col in df.columns
+    }
+    # Row-level accumulators
+    row_states = ["pass"] * n
+    row_reasons: list[list[str]] = [[] for _ in range(n)]
 
-    for row in df.itertuples(index=False):
-        row_results: list[QCResult] = []
-
+    for i, row in enumerate(df.itertuples(index=False)):
         for col in variable_columns:
+            if col not in var_states:
+                continue
             val = getattr(row, col, None)
             if val is None or pd.isna(val):
                 continue
@@ -189,21 +203,32 @@ def apply_pipeline_to_df(
                     ctx["tair"] = tair_val
 
             results = pipeline.run(float(val), **ctx)
-            row_results.extend(results)
 
-        if row_results:
-            state = QCPipeline.aggregate_state(row_results)
-            reasons = QCPipeline.reason_codes(row_results)
-        else:
-            state = "pass"
-            reasons = []
+            # Aggregate per-variable state
+            col_state = QCPipeline.aggregate_state(results)
+            col_reasons = QCPipeline.reason_codes(results)
 
-        qc_states.append(state)
-        qc_reasons.append(",".join(reasons) if reasons else "")
+            var_states[col][i] = col_state
+            var_reasons[col][i] = col_reasons
+
+            # Accumulate row-level summary with variable-qualified reasons
+            if col_state == "fail":
+                row_states[i] = "fail"
+            elif col_state == "suspect" and row_states[i] != "fail":
+                row_states[i] = "suspect"
+            for r in col_reasons:
+                row_reasons[i].append(f"{col}:{r}")
 
     df = df.copy()
-    df["qc_state"] = qc_states
-    df["qc_reason_codes"] = qc_reasons
+
+    # Write per-variable QC columns
+    for col in var_states:
+        df[f"{col}_qc_state"] = var_states[col]
+        df[f"{col}_qc_reason_codes"] = [",".join(r) if r else "" for r in var_reasons[col]]
+
+    # Write row-level summary
+    df["qc_state"] = row_states
+    df["qc_reason_codes"] = [",".join(r) if r else "" for r in row_reasons]
 
     # Replace old qc_passed bool if present
     if "qc_passed" in df.columns:
