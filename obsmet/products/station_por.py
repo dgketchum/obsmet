@@ -160,8 +160,15 @@ def _apply_tier2_qc(
 
 _N_BUCKETS = 100
 _GDAS_STAGE_DIRNAME = "_gdas_hourly_stage"
+# Daily variable columns for Tier 2 QC in station_por. These are the post-aggregation
+# column names (tmax/tmin/tmean derived from tair, rsds derived from rsds_hourly).
+# Sources not listed here fall through to _VARIABLE_COLUMNS (hourly names), which
+# only works for daily-native sources where hourly and daily names are the same.
 _STATION_POR_VARIABLE_COLUMNS: dict[str, list[str]] = {
+    "madis": ["tmax", "tmin", "tmean", "td", "rh", "wind", "wind_dir", "prcp", "rsds"],
+    "ghcnh": ["tmax", "tmin", "tmean", "td", "wind", "wind_dir", "slp", "psfc", "prcp", "rh"],
     "gdas": ["tmean", "td", "psfc"],
+    "ndbc": ["tmax", "tmin", "tmean", "td", "wind", "wind_dir", "slp"],
     "snotel": ["tmax", "tmin", "tmean", "prcp", "swe", "snow_depth"],
     "eccc": ["tmax", "tmin", "tmean", "td", "rh", "wind", "wind_dir", "prcp", "psfc"],
 }

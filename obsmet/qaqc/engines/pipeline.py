@@ -63,10 +63,14 @@ QC_PROFILES: dict[str, dict] = {
 # Variable columns and MADIS reverse mapping
 # --------------------------------------------------------------------------- #
 
+# Hourly variable columns present in normalized output (used for Tier 1 QC at normalize time).
+# These must match the actual column names in the normalized parquet, NOT the daily-derived names.
+# Daily names (tmax, tmin, tmean, rsds) are derived by aggregate_daily_wide and are listed in
+# _STATION_POR_VARIABLE_COLUMNS in station_por.py for Tier 2 QC.
 _VARIABLE_COLUMNS: dict[str, list[str]] = {
-    "madis": ["tmax", "tmin", "tmean", "td", "rh", "wind", "wind_dir", "prcp", "rsds"],
+    "madis": ["tair", "td", "rh", "wind", "wind_dir", "prcp", "rsds_hourly"],
     "isd": ["tair", "td", "wind", "wind_dir", "slp", "prcp"],
-    "ghcnh": ["tmax", "tmin", "tmean", "td", "wind", "wind_dir", "slp", "psfc", "prcp", "rh"],
+    "ghcnh": ["tair", "td", "wind", "wind_dir", "slp", "psfc", "prcp", "rh"],
     "ghcnd": ["tmax", "tmin", "tmean", "prcp", "snow", "snow_depth", "wind", "swe"],
     "gdas": ["tair", "td", "wind", "wind_dir", "psfc", "prcp"],
     "raws": ["tmean", "tmax", "tmin", "wind", "wind_dir", "rh", "prcp", "rsds"],

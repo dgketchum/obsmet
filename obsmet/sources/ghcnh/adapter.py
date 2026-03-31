@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from obsmet.core.provenance import RunProvenance
@@ -118,29 +119,37 @@ def normalize_station_psv(
     out["lon"] = pd.to_numeric(df["Longitude"], errors="coerce").values
     out["elev_m"] = pd.to_numeric(df["Elevation"], errors="coerce").values
 
-    # Map variables and check QC
-    qc_states = ["pass"] * len(df)
-    qc_reasons = [""] * len(df)
+    # Map variables and check QC — per-variable state columns
+    _STATE_RANK = {"pass": 0, "suspect": 1, "fail": 2}
+    row_states = ["pass"] * n
+    row_reasons: list[list[str]] = [[] for _ in range(n)]
 
     for ghcnh_var, (canon_name, _unit) in VARIABLE_MAP.items():
         if ghcnh_var not in df.columns:
             continue
-        out[canon_name] = pd.to_numeric(df[ghcnh_var], errors="coerce").values
+        vals = pd.to_numeric(df[ghcnh_var], errors="coerce")
+        var_states = ["pass"] * n
+        var_reasons: list[list[str]] = [[] for _ in range(n)]
 
         # Check quality codes
         qc_col = f"{ghcnh_var}_Quality_Code"
         if qc_col in df.columns:
             for i, qc_val in enumerate(df[qc_col]):
                 if pd.notna(qc_val) and str(qc_val).strip() in _BAD_QC_CODES:
-                    qc_states[i] = "fail"
-                    reason = f"{canon_name}:qc_{qc_val}"
-                    if qc_reasons[i]:
-                        qc_reasons[i] += f",{reason}"
-                    else:
-                        qc_reasons[i] = reason
+                    vals.iloc[i] = np.nan  # null the bad variable value
+                    var_states[i] = "fail"
+                    var_reasons[i].append(f"{canon_name}:qc_{qc_val}")
+                    # Update row-level summary
+                    if _STATE_RANK["fail"] > _STATE_RANK[row_states[i]]:
+                        row_states[i] = "fail"
+                    row_reasons[i].append(f"{canon_name}:qc_{qc_val}")
 
-    out["qc_state"] = qc_states
-    out["qc_reason_codes"] = qc_reasons
+        out[canon_name] = vals.values
+        out[f"{canon_name}_qc_state"] = var_states
+        out[f"{canon_name}_qc_reason_codes"] = [",".join(r) if r else "" for r in var_reasons]
+
+    out["qc_state"] = row_states
+    out["qc_reason_codes"] = [",".join(r) if r else "" for r in row_reasons]
     out["ingest_run_id"] = provenance.run_id
     out["transform_version"] = provenance.transform_version
     out["raw_source_uri"] = str(psv_path)

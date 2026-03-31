@@ -148,9 +148,12 @@ def _apply_precedence_daily(
             sdf_aligned = sdf.copy()
             sdf_aligned["date"] = pd.to_datetime(sdf_aligned["date"]).dt.date
 
-            # Only take rows that passed QC
-            if "qc_state" in sdf_aligned.columns:
-                sdf_aligned = sdf_aligned[sdf_aligned["qc_state"] != "fail"]
+            # Per-variable QC: null this variable where its QC says fail
+            var_qc_col = f"{var_name}_qc_state"
+            if var_qc_col in sdf_aligned.columns:
+                sdf_aligned.loc[sdf_aligned[var_qc_col] == "fail", var_name] = np.nan
+            elif "qc_state" in sdf_aligned.columns:
+                sdf_aligned.loc[sdf_aligned["qc_state"] == "fail", var_name] = np.nan
 
             merged = result[["date"]].merge(
                 sdf_aligned[["date", var_name]],
@@ -204,8 +207,12 @@ def _apply_precedence_hourly(
             sdf_aligned = sdf.copy()
             sdf_aligned["datetime_utc"] = pd.to_datetime(sdf_aligned["datetime_utc"], utc=True)
 
-            if "qc_state" in sdf_aligned.columns:
-                sdf_aligned = sdf_aligned[sdf_aligned["qc_state"] != "fail"]
+            # Per-variable QC: null this variable where its QC says fail
+            var_qc_col = f"{var_name}_qc_state"
+            if var_qc_col in sdf_aligned.columns:
+                sdf_aligned.loc[sdf_aligned[var_qc_col] == "fail", var_name] = np.nan
+            elif "qc_state" in sdf_aligned.columns:
+                sdf_aligned.loc[sdf_aligned["qc_state"] == "fail", var_name] = np.nan
 
             merged = result[["datetime_utc"]].merge(
                 sdf_aligned[["datetime_utc", var_name]],
