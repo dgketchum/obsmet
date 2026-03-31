@@ -85,6 +85,10 @@ class TestBuildDefaultPipeline:
         pipeline = build_default_pipeline("isd")
         assert len(pipeline.rules) == 2
 
+    def test_gdas_pipeline_has_three_rules(self):
+        pipeline = build_default_pipeline("gdas")
+        assert len(pipeline.rules) == 3
+
 
 class TestApplyPipelineToDf:
     def test_good_values_pass(self):
@@ -124,6 +128,35 @@ class TestApplyPipelineToDf:
         assert df.iloc[0]["qc_state"] == "pass"  # all NaN → pass by default
         assert df.iloc[1]["qc_state"] == "pass"
 
+    def test_preserves_adapter_native_qc_on_null_values(self):
+        """Pipeline must not overwrite adapter QC when value is NaN.
+
+        Simulates the GHCNh/ECCC path: adapter nulls a bad value and sets
+        {var}_qc_state='fail'. Pipeline should preserve that state, not
+        reset it to 'pass' because the value is NaN.
+        """
+        df = pd.DataFrame(
+            {
+                "tair": [np.nan, 20.0],
+                "td": [5.0, 10.0],
+                "tair_qc_state": ["fail", "pass"],
+                "tair_qc_reason_codes": ["tair:qc_3", ""],
+                "td_qc_state": ["pass", "pass"],
+                "td_qc_reason_codes": ["", ""],
+                "qc_state": ["fail", "pass"],
+                "qc_reason_codes": ["tair:qc_3", ""],
+            }
+        )
+        pipeline = build_default_pipeline("isd")
+        result = apply_pipeline_to_df(df, pipeline, ["tair", "td"], source="isd")
+        # Row 0: tair was nulled by adapter, QC should stay fail
+        assert result.iloc[0]["tair_qc_state"] == "fail"
+        assert "tair:qc_3" in result.iloc[0]["tair_qc_reason_codes"]
+        # Row 0: td was fine, should stay pass
+        assert result.iloc[0]["td_qc_state"] == "pass"
+        # Row-level should reflect the worst (fail from tair)
+        assert result.iloc[0]["qc_state"] == "fail"
+
     def test_replaces_qc_passed(self):
         df = pd.DataFrame(
             {
@@ -135,6 +168,30 @@ class TestApplyPipelineToDf:
         df = apply_pipeline_to_df(df, pipeline, ["tair"], source="isd")
         assert "qc_state" in df.columns
         assert "qc_passed" not in df.columns
+
+    def test_gdas_qm_can_fail_row(self):
+        df = pd.DataFrame(
+            {
+                "tair": [20.0],
+                "tair_qm": [9],
+            }
+        )
+        pipeline = build_default_pipeline("gdas")
+        df = apply_pipeline_to_df(df, pipeline, ["tair"], source="gdas")
+        assert df.iloc[0]["qc_state"] == "suspect"
+        assert "qm9_missing_obs_error" in df.iloc[0]["qc_reason_codes"]
+
+    def test_gdas_qm15_is_retained_as_suspect(self):
+        df = pd.DataFrame(
+            {
+                "tair": [20.0],
+                "tair_qm": [15],
+            }
+        )
+        pipeline = build_default_pipeline("gdas")
+        df = apply_pipeline_to_df(df, pipeline, ["tair"], source="gdas")
+        assert df.iloc[0]["qc_state"] == "suspect"
+        assert "qm15_non_use_by_analysis" in df.iloc[0]["qc_reason_codes"]
 
 
 # --------------------------------------------------------------------------- #

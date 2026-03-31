@@ -159,21 +159,37 @@ def apply_pipeline_to_df(
     is_gdas = source == "gdas"
 
     n = len(df)
-    # Per-variable accumulators
-    var_states: dict[str, list[str]] = {
-        col: ["pass"] * n for col in variable_columns if col in df.columns
-    }
-    var_reasons: dict[str, list[list[str]]] = {
-        col: [[] for _ in range(n)] for col in variable_columns if col in df.columns
-    }
-    # Row-level accumulators
-    row_states = ["pass"] * n
-    row_reasons: list[list[str]] = [[] for _ in range(n)]
+    # Per-variable accumulators — seed from pre-existing adapter QC if present,
+    # so that native flags (e.g., GHCNh Quality_Code, ECCC flag) are not overwritten.
+    present_cols = [col for col in variable_columns if col in df.columns]
+    var_states: dict[str, list[str]] = {}
+    var_reasons: dict[str, list[list[str]]] = {}
+    for col in present_cols:
+        existing_qc = f"{col}_qc_state"
+        if existing_qc in df.columns:
+            var_states[col] = df[existing_qc].fillna("pass").tolist()
+        else:
+            var_states[col] = ["pass"] * n
+        existing_reasons = f"{col}_qc_reason_codes"
+        if existing_reasons in df.columns:
+            var_reasons[col] = [
+                r.split(",") if r else [] for r in df[existing_reasons].fillna("").tolist()
+            ]
+        else:
+            var_reasons[col] = [[] for _ in range(n)]
+
+    # Row-level accumulators — seed from pre-existing row QC
+    if "qc_state" in df.columns:
+        row_states = df["qc_state"].fillna("pass").tolist()
+    else:
+        row_states = ["pass"] * n
+    if "qc_reason_codes" in df.columns:
+        row_reasons = [r.split(",") if r else [] for r in df["qc_reason_codes"].fillna("").tolist()]
+    else:
+        row_reasons = [[] for _ in range(n)]
 
     for i, row in enumerate(df.itertuples(index=False)):
-        for col in variable_columns:
-            if col not in var_states:
-                continue
+        for col in present_cols:
             val = getattr(row, col, None)
             if val is None or pd.isna(val):
                 continue
