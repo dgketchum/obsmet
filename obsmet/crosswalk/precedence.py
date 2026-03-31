@@ -20,11 +20,11 @@ class PrecedenceConfig:
 
 DEFAULT_PRECEDENCE = PrecedenceConfig(
     hourly={
-        "tair": ["ghcnh", "madis", "gdas", "ndbc"],
-        "td": ["ghcnh", "madis", "gdas", "ndbc"],
-        "rh": ["ghcnh", "madis"],
-        "wind": ["ghcnh", "madis", "gdas", "ndbc"],
-        "wind_dir": ["ghcnh", "madis", "gdas", "ndbc"],
+        "tair": ["ghcnh", "madis", "gdas", "eccc", "ndbc"],
+        "td": ["ghcnh", "madis", "gdas", "eccc", "ndbc"],
+        "rh": ["ghcnh", "madis", "eccc"],
+        "wind": ["ghcnh", "madis", "gdas", "eccc", "ndbc"],
+        "wind_dir": ["ghcnh", "madis", "gdas", "eccc", "ndbc"],
         "wind_gust": ["ghcnh", "ndbc"],
         "slp": ["ghcnh", "gdas", "ndbc"],
         "psfc": ["ghcnh", "gdas"],
@@ -41,8 +41,9 @@ DEFAULT_PRECEDENCE = PrecedenceConfig(
         "snow_depth": ["ghcnd"],
         "wind": ["ghcnd", "raws_wrcc", "snotel", "ndbc"],
         "rh": ["raws_wrcc", "snotel"],
-        "td": ["ndbc"],
+        "td": ["eccc", "ndbc"],
         "slp": ["ndbc"],
+        "psfc": ["eccc"],
     },
 )
 

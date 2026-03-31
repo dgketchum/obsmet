@@ -52,6 +52,10 @@ _SOURCES: dict[str, dict] = {
         "adapter": "obsmet.sources.snotel.adapter.SnotelAdapter",
         "parallel": True,
     },
+    "eccc": {
+        "adapter": "obsmet.sources.eccc.adapter.EcccAdapter",
+        "parallel": True,
+    },
 }
 
 

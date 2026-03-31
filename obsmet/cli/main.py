@@ -45,6 +45,7 @@ _DEFAULT_RAW_DIRS = {
     "raws": "/nas/climate/raws/wrcc/station_data",
     "ndbc": "/nas/climate/ndbc/ndbc_records",
     "snotel": "/nas/climate/snotel/hourly",
+    "eccc": "/nas/climate/eccc/hourly",
 }
 
 _DEFAULT_NORM_DIRS = {
@@ -56,6 +57,7 @@ _DEFAULT_NORM_DIRS = {
     "raws": "/mnt/mco_nas1/shared/obsmet/normalized/raws_wrcc",
     "ndbc": "/mnt/mco_nas1/shared/obsmet/normalized/ndbc",
     "snotel": "/mnt/mco_nas1/shared/obsmet/normalized/snotel",
+    "eccc": "/mnt/mco_nas1/shared/obsmet/normalized/eccc",
 }
 
 # Manifest source names (some differ from CLI source name)
@@ -68,6 +70,7 @@ _MANIFEST_SOURCE = {
     "raws": "raws_wrcc",
     "ndbc": "ndbc",
     "snotel": "snotel",
+    "eccc": "eccc",
 }
 
 
@@ -1453,7 +1456,7 @@ def _build_station_por(
     from obsmet.products.station_por import build_station_por
 
     if source == "all":
-        sources = ["madis", "ghcnh", "ghcnd", "gdas", "ndbc", "snotel", "raws"]
+        sources = ["madis", "ghcnh", "ghcnd", "gdas", "ndbc", "snotel", "raws", "eccc"]
     else:
         sources = [source]
 

@@ -163,6 +163,7 @@ _GDAS_STAGE_DIRNAME = "_gdas_hourly_stage"
 _STATION_POR_VARIABLE_COLUMNS: dict[str, list[str]] = {
     "gdas": ["tmean", "td", "psfc"],
     "snotel": ["tmax", "tmin", "tmean", "prcp", "swe", "snow_depth"],
+    "eccc": ["tmax", "tmin", "tmean", "td", "rh", "wind", "wind_dir", "prcp", "psfc"],
 }
 
 

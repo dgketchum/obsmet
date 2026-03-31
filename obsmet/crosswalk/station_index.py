@@ -17,7 +17,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # Sources whose normalized output is one parquet per station
-_PER_STATION_SOURCES = {"ghcnd", "ghcnh", "snotel", "ndbc", "raws_wrcc"}
+_PER_STATION_SOURCES = {"ghcnd", "ghcnh", "snotel", "ndbc", "raws_wrcc", "eccc"}
 
 # Sources whose normalized output is one parquet per day (many stations per file)
 _PER_DAY_SOURCES = {"madis", "gdas"}
@@ -27,6 +27,7 @@ _TEMPORAL_RES = {
     "ghcnh": "hourly",
     "isd": "hourly",
     "snotel": "hourly",
+    "eccc": "hourly",
     "ndbc": "hourly",
     "raws_wrcc": "daily",
     "madis": "hourly",
@@ -40,6 +41,7 @@ _FILENAME_KEY_PREFIX = {
     "ghcnh": "ghcnh",
     "ndbc": "ndbc",
     "raws_wrcc": "raws",
+    "eccc": "eccc",
 }
 
 

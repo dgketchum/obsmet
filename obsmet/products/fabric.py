@@ -25,6 +25,7 @@ _NORM_DIRS = {
     "snotel": "/mnt/mco_nas1/shared/obsmet/normalized/snotel",
     "ndbc": "/mnt/mco_nas1/shared/obsmet/normalized/ndbc",
     "raws_wrcc": "/mnt/mco_nas1/shared/obsmet/normalized/raws_wrcc",
+    "eccc": "/mnt/mco_nas1/shared/obsmet/normalized/eccc",
 }
 
 # Sources with station_por products (daily aggregation + Tier 2 QC).
